@@ -644,7 +644,7 @@ private:
 		u8  running[4] = {};
 		std::vector<u8> partial[4];   // 今組み立てている 1 メッセージ分
 		int partial_want[4] = {};     // 揃うべき長さ（0 なら未確定、-1 は SysEx 途中）
-		bool fast_usb = false;        // S-MU2000: USB シリアル遅延をスキップするか
+		u64  rx_last_starvation = 0;  // S-MU2000: rx キューが最後に飢餓回避で送出された時刻
 		size_t queued() const
 		{
 			size_t n = cur_msg.size();
