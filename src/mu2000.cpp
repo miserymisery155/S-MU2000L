@@ -943,18 +943,17 @@ void mu2000::usb_midi_in(u8 byte, int port)
 	usb_line &u = m_usb;
 	if (port < 0 || port >= 4)
 		port = 0;
-
 	if (u.queued() >= MIDI_QUEUE_LIMIT) {
-		m_midi_dropped.fetch_add(1, std::memory_order_relaxed);
-		return;
-	}
-
-	// リアルタイム（0xf8 以上）は単発。組み立て中のメッセージの外に割り込んでも
-	// よい種類なので、そのまま 1 バイトのメッセージとして扱う
-	if (byte >= 0xf8) {
-		u.rx.push_back({ u8(port), { byte } });
-		return;
-	}
+	 	m_midi_dropped.fetch_add(1, std::memory_order_relaxed);
+	 	return;
+	 }
+	 u64 now = m_cpu ? m_cpu->total_cycles() : 0;
+	 // リアルタイム（0xf8 以上）は単発。組み立て中のメッセージの外に割り込んでも
+	 // よい種類なので、そのまま 1 バイトのメッセージとして扱う
+	 if (byte >= 0xf8) {
+	 	u.rx.push_back({ u8(port), { byte }, now });
+	 	return;
+	 }
 
 	std::vector<u8> &acc = u.partial[port];
 	int &want = u.partial_want[port];
@@ -995,21 +994,20 @@ void mu2000::usb_midi_in(u8 byte, int port)
 		acc.push_back(byte);
 	}
 
-	if (want == -1) {
-		if (byte == 0xf7) {
-			u.rx.push_back({ u8(port), std::move(acc) });   // SysEx は CC などと同じ扱いでよい
-			acc.clear();
-			want = 0;
-		}
-		return;
-	}
-
-	if (want > 0 && int(acc.size()) >= want) {
-		auto &q = usb_midi_is_note(acc) ? u.rx_hi : u.rx;
-		q.push_back({ u8(port), std::move(acc) });
-		acc.clear();
-		want = 0;
-	}
+	 if (want == -1) {
+	 	if (byte == 0xf7) {
+	 		u.rx.push_back({ u8(port), std::move(acc), now });   // SysEx は CC などと同じ扱いでよい
+	 		acc.clear();
+	 		want = 0;
+	 	}
+	 	return;
+	 }
+	 if (want > 0 && int(acc.size()) >= want) {
+	 	auto &q = usb_midi_is_note(acc) ? u.rx_hi : u.rx;
+	 	q.push_back({ u8(port), std::move(acc), now });
+	 	acc.clear();
+	 	want = 0;
+	 }
 }
 
 void mu2000::usb_step(u64 now)
@@ -1032,9 +1030,21 @@ void mu2000::usb_step(u64 now)
 	// 2 本のキューを優先度で行き来しても、firmware から見た口の並びは
 	// 実際に出た順のままなので、どちらのキューから来たかに関わらず正しい
 	if (u.cur_msg.empty() && (!u.rx_hi.empty() || !u.rx.empty())) {
-		const bool from_hi = !u.rx_hi.empty();
+		// 5ms (28MHz * 0.005 = 140,000 cycles) を超えて rx が溜まっていたら、
+		// 飢餓を防ぐために rx を優先して送出する
+		constexpr u64 USB_RX_STARVATION_CYCLES = 28000000 / 200; // 5ms
+		bool from_hi = true;
+		if (u.rx_hi.empty()) {
+			from_hi = false;
+		} else if (!u.rx.empty()) {
+			if (now - u.rx.front().timestamp >= USB_RX_STARVATION_CYCLES) {
+				from_hi = false;
+			}
+		}
+
 		usb_line::qmsg msg = std::move(from_hi ? u.rx_hi.front() : u.rx.front());
 		if (from_hi) u.rx_hi.pop_front(); else u.rx.pop_front();
+
 		if (msg.port != u.in_port) {
 			u.cur_msg.push_back(0xf5);
 			u.cur_msg.push_back(u8(msg.port + 1));
