@@ -1030,21 +1030,29 @@ void mu2000::usb_step(u64 now)
 	// 2 本のキューを優先度で行き来しても、firmware から見た口の並びは
 	// 実際に出た順のままなので、どちらのキューから来たかに関わらず正しい
 	if (u.cur_msg.empty() && (!u.rx_hi.empty() || !u.rx.empty())) {
-		// 5ms (28MHz * 0.005 = 140,000 cycles) を超えて rx が溜まっていたら、
-		// 飢餓を防ぐために rx を優先して送出する
+		// S-MU2000 patch: 飢餓回避のための公平性チェック。
+		// rx_hi (ノート) を優先しつつ、rx (CCなど) が 5ms 以上待たされたら
+		// 1 メッセージだけ rx から送出する。ただし、一度 rx を出したら
+		// 再び 5ms 待たないと次の公平性送出は行わない（rx が連続して
+		// 溜まっている場合に rx_hi が完全にブロックされるのを防ぐ）。
 		constexpr u64 USB_RX_STARVATION_CYCLES = 28000000 / 200; // 5ms
 		bool from_hi = true;
+		
 		if (u.rx_hi.empty()) {
 			from_hi = false;
 		} else if (!u.rx.empty()) {
+			// rx の先頭が 5ms 以上待っており、かつ前回 rx を出してから 5ms 経過しているか
 			if (now - u.rx.front().timestamp >= USB_RX_STARVATION_CYCLES) {
-				from_hi = false;
+				if (now - u.rx_last_starvation >= USB_RX_STARVATION_CYCLES) {
+					from_hi = false;
+					u.rx_last_starvation = now; // タイマーをリセット
+				}
 			}
 		}
 
 		usb_line::qmsg msg = std::move(from_hi ? u.rx_hi.front() : u.rx.front());
 		if (from_hi) u.rx_hi.pop_front(); else u.rx.pop_front();
-
+		
 		if (msg.port != u.in_port) {
 			u.cur_msg.push_back(0xf5);
 			u.cur_msg.push_back(u8(msg.port + 1));
