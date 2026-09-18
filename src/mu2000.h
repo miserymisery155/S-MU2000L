@@ -618,7 +618,14 @@ private:
 		// 送り出す直前**、firmware がいま覚えている口（in_port、1 本だけ）
 		// と比べて要るときだけ挟む。2 本のキューを行き来しても、firmware から
 		// 見えるのは常に正しい直近の口なので取り違えない
-		struct qmsg { u8 port; std::vector<u8> bytes; };
+		struct qmsg {
+			u8 port;
+			std::vector<u8> bytes;
+			u64 timestamp = 0;
+			qmsg() = default;
+			qmsg(u8 p, std::vector<u8> b, u64 t) : port(p), bytes(std::move(b)), timestamp(t) {}
+		};
+		std::deque<qmsg> rx_hi, rx;
 		std::deque<qmsg> rx_hi, rx;
 		int  in_port  = -1;     // firmware に最後に伝えた口（F5 の要不要はこれだけで決める）
 		u64  next     = 0;      // 次のバイトを渡してよい時刻
