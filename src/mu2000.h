@@ -626,7 +626,6 @@ private:
 			qmsg(u8 p, std::vector<u8> b, u64 t) : port(p), bytes(std::move(b)), timestamp(t) {}
 		};
 		std::deque<qmsg> rx_hi, rx;
-		std::deque<qmsg> rx_hi, rx;
 		int  in_port  = -1;     // firmware に最後に伝えた口（F5 の要不要はこれだけで決める）
 		u64  next     = 0;      // 次のバイトを渡してよい時刻
 		bool have     = false;  // 渡したバイトをまだ読まれていない
