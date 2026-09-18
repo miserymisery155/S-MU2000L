@@ -1013,11 +1013,39 @@ void mu2000::usb_midi_in(u8 byte, int port)
 void mu2000::usb_step(u64 now)
 {
 	usb_line &u = m_usb;
-
-	// USB を使っていないときは何もしない。割り込みを上げると firmware の
-	// USB ドライバが動き出してしまう
 	if (!m_usb_host && u.rx_hi.empty() && u.rx.empty() && u.cur_msg.empty() && !u.have)
+	 	return;
+
+	// S-MU2000 patch: "Instant USB" mode. If enabled, we bypass the 19,500 B/s
+	// serial simulation and inject messages directly into the firmware's input
+	// register as fast as they arrive, prioritizing notes over CCs.
+	if (u.fast_usb) {
+		if (u.have) return; // Wait for firmware to read the current byte
+
+		if (u.cur_msg.empty() && (!u.rx_hi.empty() || !u.rx.empty())) {
+			const bool from_hi = !u.rx_hi.empty();
+			usb_line::qmsg msg = std::move(from_hi ? u.rx_hi.front() : u.rx.front());
+			if (from_hi) u.rx_hi.pop_front(); else u.rx.pop_front();
+
+			// Handle port switching (F5) instantly
+			if (msg.port != u.in_port) {
+				u.cur_msg.push_back(0xf5);
+				u.cur_msg.push_back(u8(msg.port + 1));
+				u.in_port = msg.port;
+			}
+			for (u8 b : msg.bytes)
+				u.cur_msg.push_back(b);
+		}
+
+		if (!u.cur_msg.empty()) {
+			u.cur = u.cur_msg.front();
+			u.cur_msg.pop_front();
+			u.have = true;
+			u.next = now; // Ready for next byte immediately
+			m_cpu->execute_set_input(3, 1); // Trigger IRQ instantly
+		}
 		return;
+	}
 
 	// **S-MU2000 patch**: 送っている最中のメッセージ（cur_msg）がなければ、
 	// 次に何を出すかをここで選ぶ。ノートオン/オフ（rx_hi）を CC などの一般の
