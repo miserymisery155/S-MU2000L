@@ -413,16 +413,44 @@ private:
 
 	void native_pump();
 	// 写し取った音の、フィルタの動きを録る（doc/native-engine.md の 6.17）
-	bool m_traj_rec = false;
-	u32  m_traj_left = 0;
-	u64  m_traj_start = 0;
-	u32  m_traj_rec_key = 0;
-	u64  m_traj_drum_key = 0;
-	int  m_traj_chan[64];          // チャンネル → 何番目の写し取りか（-1 は使わない）
-	std::vector<xg::nv::voice_cal> *m_traj_cals = nullptr;
-	u32  m_traj_n = 0;
-	void traj_start(u32 rec, u64 drum_key, int ncal);
-	void traj_finish();
+	// **フィルタの動きの録り**。同時に何本も走らせる。
+	// 1 本しか持てなかったころは、次の音色の写し取りが始まると前の録りが
+	// そこで切れていた。切れないように「録っている間は写し取りを始めない」
+	// ようにしていたが、そうすると窓を延ばせず、押している間の包絡線が
+	// 1 秒で止まっていた（doc/native-engine.md の 6.61）
+	struct traj_rec {
+		std::vector<xg::nv::voice_cal> *cals = nullptr;
+		u64  start = 0;
+		u32  left = 0;          // 0 なら空き
+		u32  n = 0;
+		u32  rec_key = 0;
+		u32  ctx = 0;
+		u64  drum_key = 0;
+		s8   chan[64] = {};     // チャンネル → 何番目の写しか（-1 は関係なし）
+		u64  rel_at[64] = {};   // そのスロットを離した時刻（0 はまだ）
+	};
+	static constexpr int TRAJ_MAX = 6;
+	traj_rec m_trajs[TRAJ_MAX];
+	bool traj_any() const
+	{
+		for (const traj_rec &t : m_trajs)
+			if (t.left)
+				return true;
+		return false;
+	}
+	void traj_step();               // 1 サンプルぶん進める
+	void traj_watch(u32 reg, u16 value);
+	bool m_traj_rec = false;        // どれか 1 本でも録っているか（native_driver へ渡す用）
+	void traj_start(u32 rec, u64 drum_key, int ncal, u32 ctx);
+	void traj_finish_one(int i);
+
+	// **短すぎる写しは取り直す**。フィルタの動きは firmware に鳴らさせた
+	// 1 音から録るので、その音が短いと途中で切れる。切れたぶんは native で
+	// 鳴らすときに「そこで止まった音」になり、実機より暗い（利用者の曲で
+	// 中域が 1dB 足りなかった）。何度か取り直して、いちばん長いものを使う
+	static constexpr u32 TRAJ_ENOUGH = 60;   // 60 段 ＝ 0.6 秒ぶん
+	static constexpr int TRAJ_TRIES  = 4;
+	std::map<u64, int> m_traj_tries;
 	// そのバイトを受け終える時刻を進めて、鳴らすべき時刻（サンプル）を返す
 	u64 rx_advance(int port)
 	{

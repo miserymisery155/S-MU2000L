@@ -301,6 +301,95 @@ inline int velocity_att(const u8 *rom, int vel, int curve = 0)
 	return rom[LEVEL_TAB + u32(i & 0x7f)];
 }
 
+// ---- **フィルタの包絡線**（doc/native-engine.md の 6.63）
+//
+// 実機は firmware のソフトでこれを動かしていて、10ms ごとに
+// 切る高さへ足す値を作り直す。折れ線で、状態は 3 つ:
+//
+//   累算  段の中でいまどこまで来たか（`[音+66]`）
+//   目標  その段の行き先（`[音+68]`）
+//   増分  1 段あたりの足し引き（`[音+70]`。0x8000 なら「すぐ次の段」）
+//
+// 10ms ごとに 累算 += 増分 して、向きに応じて目標を越えたら次の段へ。
+// 切る高さに足す値は **累算 >> 2**。
+//
+// 段は要素のバイトで決まる（要素 + 2 を基準に読んでいるので、ここでは
+// 要素そのものの番号で書く）:
+//
+//   はじめの累算 = 目標(byte55)
+//   段 1: 目標 = 目標(byte56)、速さ = byte51
+//   段 2: 目標 = 目標(byte57)、速さ = byte52
+//
+// Kitayama（0,72,5）鍵 60・強さ 100 の実機の値で全部合わせた（6.63）
+constexpr u32 FENV_INC_TAB = 0x1E5C58;   // 速さ → 増分（16bit 符号つき × 64）
+
+inline int rd16s(const u8 *rom, u32 a)
+{
+	const int v = int(rd16(rom, a));
+	return v >= 0x8000 ? v - 0x10000 : v;
+}
+
+// 0 の側へ丸める >>8（実機は符号で分けている）
+inline int sh8(int v) { return v >= 0 ? (v >> 8) : -((-v) >> 8); }
+
+// **包絡線の深さ**（実機の `[音+93]`。`0x128ADC`）。
+// 強さの表を byte8 で選び、byte46 の深さと掛け合わせる。
+//   深さ = ((36 × (byte46 - 64)) × (0x80 - 表[強さ]) × 2) >> 8
+// 表は byte8 が 0 なら 0x1E5D58、そうでなければ 0x1E5DD8。
+// GrandPno（byte46=70・byte8=1・強さ 100）で 111、
+// Kitayama（byte46=71・byte8=0）で 72。どちらも実機の値と一致した。
+// **パートの塊 +210 が 0 でないときの枝はまだ起こしていない**
+// （そこは深さがもう一段変わる。既定の音色では 0）
+constexpr u32 FENV_VEL_TAB0 = 0x1E5D58;
+constexpr u32 FENV_VEL_TAB1 = 0x1E5DD8;
+
+inline int fenv_depth(const u8 *rom, const u8 *elem, int vel)
+{
+	if (!rom || !elem)
+		return 0;
+	const int d = int(elem[46]) - 64;
+	if (d < 0)
+		return 0;                    // 負の枝はまだ起こしていない
+	const u32 tab = elem[8] ? FENV_VEL_TAB1 : FENV_VEL_TAB0;
+	const int t = rom[tab + u32(vel & 0x7f)];
+	const int v = (36 * d) * (0x80 - t);
+	return int((u32(v) * 2 & 0xffff) >> 8);
+}
+
+// レベルのバイト → 目標
+inline int fenv_target(const u8 *rom, const u8 *elem, int level, int vel)
+{
+	const int x = (level - 64) * 2;
+	return (x - sh8(x * fenv_depth(rom, elem, vel))) * 64;
+}
+
+// 速さへの足し込み。鍵のぶん（byte48 が深さ・byte49 が基準鍵）と
+// 強さのぶん（byte47 が深さ）
+inline int fenv_key_adj(const u8 *elem, int note)
+{
+	const int d = int(elem[48]) - 64;
+	return d ? sh8((note - int(elem[49])) * (d * 16)) : 0;
+}
+inline int fenv_vel_adj(const u8 *elem, int vel)
+{
+	const int d = int(elem[47]) - 64;
+	if (!d)
+		return 0;
+	const int a = d * 16;
+	return sh8(a >= 0 ? a * vel : -((-a) * (0x80 - vel)));
+}
+
+// 速さ → 増分。63 以上は「すぐ次の段」の印
+constexpr int FENV_NEXT = 0x8000;
+inline int fenv_inc(const u8 *rom, int rate)
+{
+	if (rate >= 63)
+		return FENV_NEXT;
+	if (rate < 0)
+		rate = 0;
+	return rd16s(rom, FENV_INC_TAB + u32(rate) * 2);
+}
+
 // 音色ごとの下駄。firmware は「音色の音量 → 表」と、鍵ごとの足し込みで作る。
 // 式そのものはまだ解けていないので、**1 回だけ実機に鳴らしてもらって校正する**（下）。
 // 校正しないときの当て値（実測の中央値。5〜19 の幅がある）
@@ -429,9 +518,14 @@ inline u16 release_reg(const u8 *rom, const u8 *elem, int note, int att)
 // フィルタの包絡線の 1 段。firmware はこれをソフトで動かして、鳴っている間
 // 0x00・0x01・0x04 を 10ms ごとに書き直す（doc/native-engine.md の 6.17）
 struct fstep {
-	u32 at;            // 鳴らし始めてからのサンプル数
+	u32 at;            // 鳴らし始めてからのサンプル数（rel なら離してから）
 	u8  reg;
 	u16 v;
+	// **離したあとの段**。実機はフィルタを離しのあいだも動かし続ける。
+	// 写し取りの元にした音が短いと、録れる段のほとんどがこちら側になる。
+	// 押してからの並びと離してからの並びを分けて持ち、鳴らすときも
+	// それぞれの時刻から流す（doc/native-engine.md の 6.57）
+	u8  rel = 0;
 };
 
 struct voice_cal {
@@ -505,7 +599,10 @@ inline slot_regs build_note(const u8 *rom, const u8 *elem, int note, int att,
 	// 実機はここに鍵と強さの倍率を掛ける（`0x127FA4`）が、その係数がまだ分からない。
 	// 倍率 1 として表を引くだけでも、開き切りよりはずっと実機に近い
 	r.set(0x00, u16(0x1000 | (rd16(rom, CUTOFF_TAB + u32(elem[37]) * 2) & 0x7ff)));
-	r.set(0x01, d.bypass);
+	// **鍵を押した瞬間の 0x01 は 0xFFFF**（実機は毎回そう書いて、最初の
+	// 包絡線の目で本当の値に置き換える）。14 音色を実機と突き合わせて
+	// 確かめた（doc/native-engine.md の 6.67）
+	r.set(0x01, 0xffff);
 	r.set(0x02, u16(0x8000 | elem[82]));       // 402 組の 97%
 	r.set(0x03, d.post);
 	// フィルタの第 2 パラメータ（共振）。firmware は byte35 を 1 ビット落として

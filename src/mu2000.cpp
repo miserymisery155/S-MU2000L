@@ -453,7 +453,8 @@ void mu2000::build_bus()
 		auto note = [this, want](offs_t a, u32 v, int size) {
 			const u32 pc = m_cpu ? m_cpu->pc() : 0;
 			if (pc >= want && pc <= want + 0x100)
-				std::fprintf(stderr, "ramread pc=%06x 番地=%06x = %x (%d bit)\n",
+				std::fprintf(stderr, "ramread s=%llu pc=%06x 番地=%06x = %x (%d bit)\n",
+				             (unsigned long long)trace_sample(),
 				             pc, u32(a), v, size * 8);
 		};
 		d.r8  = [this, note](offs_t a) {
@@ -475,7 +476,8 @@ void mu2000::build_bus()
 		const u32 wa = wp ? u32(std::strtoul(wp, nullptr, 16)) : 0xffffffffu;
 		auto notew = [this, wa](offs_t a, u32 v, int size) {
 			if (a <= wa && wa < a + u32(size))
-				std::fprintf(stderr, "ramwrite pc=%06x 番地=%06x = %x (%d bit)\n",
+				std::fprintf(stderr, "ramwrite s=%llu pc=%06x 番地=%06x = %x (%d bit)\n",
+				             (unsigned long long)trace_sample(),
 				             m_cpu ? m_cpu->pc() : 0, u32(a), v, size * 8);
 		};
 		d.w8  = [this, notew](offs_t a, u8 v)  { notew(a, v, 1); m_ram[a - 0x400000] = v; };
@@ -561,6 +563,12 @@ void mu2000::build_bus()
 				m_swp_watch(base == 0x800000, reg, u16(v >> 16));
 				m_swp_watch(base == 0x800000, reg + 1, u16(v));
 			}
+			// **録りは写し取りと別の口**（1 つしか無いと、次の写し取りが
+			// 始まったときに前の録りが切れる）
+			if (m_traj_rec && base == 0x800000) {
+				traj_watch(reg, u16(v >> 16));
+				traj_watch(reg + 1, u16(v));
+			}
 			note_fw_swp(base == 0x800000, reg, u16(v >> 16));
 			note_fw_swp(base == 0x800000, reg + 1, u16(v));
 			dev.write16(reg, u16(v >> 16));
@@ -574,6 +582,8 @@ void mu2000::build_bus()
 				             m_swp_trace_reads ? "W " : "", base, (a - base) >> 1, v, m_cpu->pc(), double(m_cpu->total_cycles()) / 28000000.0, (unsigned long long)trace_sample());
 			if (m_swp_watch)
 				m_swp_watch(base == 0x800000, (a - base) >> 1, v);
+			if (m_traj_rec && base == 0x800000)
+				traj_watch((a - base) >> 1, v);
 			note_fw_swp(base == 0x800000, (a - base) >> 1, v);
 			dev.write16((a - base) >> 1, v);
 			hold((a - base) >> 1);
@@ -1188,6 +1198,10 @@ void mu2000::midi_step(u64 now)
 // 報告があり、LCD を描いているのも firmware なので筋が合う
 void mu2000::note_fw_swp(bool master, u32 reg, u16 value)
 {
+	// **包絡線の格子の位相を拾う**。native の口が始まる前は firmware が
+	// 普通に走っているので、そのときの 0x00 の書き込みが格子の目にあたる
+	if (master && !m_native_engine && reg < 0x1000 && (reg % 64) == 0)
+		m_ndrv.set_eg_phase(u32(trace_sample()));
 	if (!m_native_engine || !master)
 		return;
 	// **firmware が鍵を押した瞬間のマスク**を拾う。これが firmware の
@@ -1231,8 +1245,8 @@ void mu2000::set_native_engine(int mode)
 	m_nq.clear();
 	m_sx_pos = -1;
 	m_traj_rec = false;
-	m_traj_left = 0;
-	m_traj_cals = nullptr;
+	for (traj_rec &t : m_trajs)
+		t = traj_rec();
 	m_ne_clock = 0;
 	for (u64 &t : m_rx_at)
 		t = 0;
@@ -1398,7 +1412,7 @@ void mu2000::native_learn_finish()
 		const int ndcal = int(cals.size());
 		const u64 dkey = m_learn_drum;
 		m_ndrv.learn_drum(m_learn_drum, std::move(cals));
-		traj_start(0, dkey, ndcal);
+		traj_start(0, dkey, ndcal, 0);
 		m_learn_drum = 0;
 		return;
 	}
@@ -1522,8 +1536,9 @@ void mu2000::native_learn_finish()
 				             xg::nv::key_follow(e2), xg::nv::wave_set(e2), "\n");
 		}
 	}
+	const u32 learn_ctx = cals.empty() ? 0 : cals[0].cal_ctx;
 	m_ndrv.learn(m_learn_rec, std::move(cals));
-	traj_start(m_learn_rec, 0, ncal);
+	traj_start(m_learn_rec, 0, ncal, learn_ctx);
 }
 
 
@@ -1666,73 +1681,117 @@ bool mu2000::native_cal_load(const u8 *data, size_t n)
 }
 
 // 写し取った音が鳴っている間、firmware がフィルタ（0x00・0x01・0x04）を
-// どう動かすかを録る。あとの音でも同じように動かせば、音色の動きまで揃う
-void mu2000::traj_start(u32 rec, u64 drum_key, int ncal)
+// どう動かすかを録る。あとの音でも同じように動かせば、音色の動きまで揃う。
+// **同時に何本も走らせる**（空きが無ければ録らない）
+void mu2000::traj_start(u32 rec, u64 drum_key, int ncal, u32 ctx)
 {
 	if (!ncal)
 		return;
-	m_traj_cals = drum_key ? m_ndrv.drum_cals_of(drum_key) : m_ndrv.cals_of(rec, m_learn_part);
-	if (!m_traj_cals)
+	std::vector<xg::nv::voice_cal> *cals =
+	    drum_key ? m_ndrv.drum_cals_of(drum_key) : m_ndrv.cals_of_ctx(rec, ctx);
+	if (!cals)
 		return;
+	int slot = -1;
+	for (int k = 0; k < TRAJ_MAX && slot < 0; k++)
+		if (!m_trajs[k].left)
+			slot = k;
+	if (slot < 0)
+		return;                      // 空きが無い。この音色は次の音でやり直す
+	traj_rec &t = m_trajs[slot];
+	t = traj_rec();
+	t.cals = cals;
+	t.rec_key = rec;
+	t.ctx = ctx;
+	t.drum_key = drum_key;
 	// 写し取ったチャンネルの順が、そのまま写し取りの並び
 	int n = 0;
 	for (int ch = 0; ch < 64; ch++)
-		m_traj_chan[ch] = (m_learn_keyed & (u64(1) << ch)) ? n++ : -1;
+		t.chan[ch] = (m_learn_keyed & (u64(1) << ch)) ? s8(n++) : s8(-1);
 	// 鍵を押した瞬間からの控えを、まず入れる
-	{
-		int n2 = 0;
-		int idx[64];
-		for (int ch = 0; ch < 64; ch++)
-			idx[ch] = (m_learn_keyed & (u64(1) << ch)) ? n2++ : -1;
-		for (const auto &e : m_learn_traj)
-			if (e.first < 64 && idx[e.first] >= 0 &&
-			    size_t(idx[e.first]) < m_traj_cals->size())
-				(*m_traj_cals)[idx[e.first]].filter_env.push_back(e.second);
-	}
+	for (const auto &e : m_learn_traj)
+		if (e.first < 64 && t.chan[e.first] >= 0 &&
+		    size_t(t.chan[e.first]) < cals->size())
+			(*cals)[t.chan[e.first]].filter_env.push_back(e.second);
 	m_learn_traj.clear();
-	m_traj_n = 0;
+	t.start = m_learn_key_clock ? m_learn_key_clock : m_ne_clock;
+	t.left = 44100 * 3;              // 3 秒ぶん見る（押している間の動きを取り切る）
 	m_traj_rec = true;
 	m_ndrv.set_recording(true);
-	m_traj_rec_key = rec;
-	m_traj_drum_key = drum_key;
-	m_traj_start = m_learn_key_clock ? m_learn_key_clock : m_ne_clock;
-	m_traj_left = 44100;                 // 1 秒ぶん見る
-	set_swp_watch([this](bool master, u32 reg, u16 value) {
-		if (!master)
-			return;
-		const int ch = int(reg / 64), r = int(reg % 64);
-		if (ch >= 64 || m_traj_chan[ch] < 0)
-			return;
-		// 離しに入ったらそこで打ち切る（離しの動きは鳴らすときには要らない）。
+}
+
+// SWP30 への書き込みを、録っている全部の本に配る
+void mu2000::traj_watch(u32 reg, u16 value)
+{
+	const int ch = int(reg / 64), r = int(reg % 64);
+	if (ch >= 64)
+		return;
+	for (traj_rec &t : m_trajs) {
+		if (!t.left || t.chan[ch] < 0)
+			continue;
+		// **離しに入っても止めない**。実機はフィルタを離しのあいだも動かす。
+		// 写し取りの元にした音が短いと、録れる段のほとんどが離しのあとになる。
+		// ここから先の段には印を付けて、鳴らすときは離した時刻から流す。
 		// ただし鳴らし始めてすぐは見ない。前の音の離しが同じスロットに来る
 		if (r == 0x09 && (value & 0x8000)) {
-			if (m_ne_clock - m_traj_start > 44100 / 10)
-				m_traj_left = 1;
-			return;
+			if (m_ne_clock - t.start > 44100 / 10 && !t.rel_at[ch])
+				t.rel_at[ch] = m_ne_clock;
+			continue;
 		}
 		// フィルタ（0x00・0x01・0x04）と LFO（0x05・0x0a）。
 		// LFO は「かけ始めるまでの間」や深さの増やし方を firmware がソフトでやっている
 		if (r != 0x00 && r != 0x01 && r != 0x04 && r != 0x05 && r != 0x0a)
-			return;
-		if (m_traj_n >= 2048 || size_t(m_traj_chan[ch]) >= m_traj_cals->size())
-			return;
+			continue;
+		if (t.n >= 4096 || size_t(t.chan[ch]) >= t.cals->size())
+			continue;
 		// **その場で**写し取りに足す。いま鳴っている native の音も、
 		// 次の tick でこの段を拾う（xg/native_driver.h の tick）
-		(*m_traj_cals)[m_traj_chan[ch]].filter_env.push_back(
-		    xg::nv::fstep{ u32(m_ne_clock - m_traj_start), u8(r), value });
-		m_traj_n++;
-	});
+		const u64 rel = t.rel_at[ch];
+		(*t.cals)[t.chan[ch]].filter_env.push_back(
+		    xg::nv::fstep{ u32(m_ne_clock - (rel ? rel : t.start)),
+		                   u8(r), value, u8(rel ? 1 : 0) });
+		t.n++;
+	}
 }
 
-void mu2000::traj_finish()
+// 1 サンプルぶん進めて、終わった本を片付ける
+void mu2000::traj_step()
 {
-	set_swp_watch(nullptr);
-	m_traj_rec = false;
-	m_ndrv.set_recording(false);
-	if (std::getenv("SMU2000_NATIVE_DEBUG"))
-		std::fprintf(stderr, "traj rec=%06x drum=%llx 段 %u%c", m_traj_rec_key,
-		             (unsigned long long)m_traj_drum_key, m_traj_n, 10);
-	m_traj_cals = nullptr;
+	for (int k = 0; k < TRAJ_MAX; k++)
+		if (m_trajs[k].left && --m_trajs[k].left == 0)
+			traj_finish_one(k);
+	m_traj_rec = traj_any();
+	if (!m_traj_rec)
+		m_ndrv.set_recording(false);
+}
+
+void mu2000::traj_finish_one(int i)
+{
+	traj_rec &t = m_trajs[i];
+	// 録れた段が少なければ、写し取りごと捨ててつぎの音でやり直す。
+	// 回数を切っておかないと、短い音しか鳴らさない音色がいつまでも
+	// firmware 送りのままになる
+	bool again = false;
+	if (!t.drum_key && t.rec_key && t.n < TRAJ_ENOUGH) {
+		const u64 k = u64(t.rec_key) | (u64(t.ctx) << 32);
+		int &n = m_traj_tries[k];
+		if (n < TRAJ_TRIES) {
+			n++;
+			again = true;
+			m_ndrv.drop_cal(t.rec_key, t.ctx);
+		}
+	}
+	if (std::getenv("SMU2000_NATIVE_DEBUG")) {
+		u32 nrel = 0, ntot = 0;
+		if (!again && t.cals && !t.cals->empty()) {
+			ntot = u32((*t.cals)[0].filter_env.size());
+			for (const auto &e : (*t.cals)[0].filter_env)
+				nrel += e.rel ? 1 : 0;
+		}
+		std::fprintf(stderr, "traj rec=%06x drum=%llx 段 %u（写し1 は %u 段、うち離し %u）%s%c",
+		             t.rec_key, (unsigned long long)t.drum_key, t.n,
+		             ntot, nrel, again ? "（短いので取り直す）" : "", 10);
+	}
+	t = traj_rec();
 }
 
 // バンクとプログラムから音色の記録を引いて、native の口に渡す。
@@ -2015,7 +2074,14 @@ bool mu2000::native_midi(u8 byte, int port)
 	// まだ写し取っていない音（ドラムは音ごと）。firmware に鳴らさせて覚える
 	const u32 rec = m_ndrv.record_of(part);
 	const bool drum = m_ndrv.is_drum(part);
-	// 知らない CC で firmware に任せているパートは、写し取っても使わない
+	// 知らない CC で firmware に任せているパートは、写し取っても使わない。
+	// **前の音色のフィルタの動きを録っている間は始めない**（m_traj_rec）。
+	// 写し取りも録りも SWP30 の覗き口（set_swp_watch）を 1 つしか持てないので、
+	// 新しい写し取りを始めると前の録りがそこで切れる。実測では、曲の頭で
+	// 3 パートがほぼ同時に鳴り出すと、最後の 1 つ以外は **4 段（139ms）**で
+	// 切れていた（実機は 110 段・1.1 秒かけてフィルタを閉じる）。
+	// 録り終わるまで待つぶん、その音色が native になるのは遅れるが、
+	// その間は firmware が鳴らすので音は正しい
 	if ((rec || drum) && !m_learning && !m_ndrv.delegated(part)) {
 		m_learn_note = note;
 		m_learn_vel = vel;
@@ -2234,6 +2300,13 @@ void mu2000::run_sample(s32 &left, s32 &right)
 		// MIDI の溜まり具合は、止まっているときだけ見る（毎サンプル数えると重い）
 		if (m_fw_note_total && m_ne_clock < m_fw_note_until)
 			m_fw_hold = std::max(m_fw_hold, u32(2));
+		// **フィルタの動きを録っている間は firmware を全速で回す**。
+		// 包絡線を動かしているのは firmware のソフトで、10ms ごとに
+		// 0x00・0x01・0x04 を書き直す。細く回している（100ms につき 5ms）
+		// ままだと firmware の時間が 20 分の 1 しか進まず、1 秒の窓で
+		// 実機の 5% ぶんしか録れない。音色 1 つにつき 1 秒だけの負担
+		if (m_traj_rec)
+			m_fw_hold = std::max(m_fw_hold, u32(2));
 		// **firmware を細く回し続ける**。ここを入れるまでは、全部 native で
 		// 鳴る曲だと MIDI が来たときしか CPU を回さず、firmware が丸ごと
 		// 止まっていた。その結果:
@@ -2283,8 +2356,8 @@ void mu2000::run_sample(s32 &left, s32 &right)
 		if (!m_nq.empty())
 			native_pump();
 		m_ndrv.tick(m_ne_clock);
-		if (m_traj_rec && m_traj_left && --m_traj_left == 0)
-			traj_finish();
+		if (m_traj_rec)
+			traj_step();
 	}
 	if (run_cpu)
 		run_cycles(cycles);
