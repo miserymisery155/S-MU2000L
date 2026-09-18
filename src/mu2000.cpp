@@ -910,19 +910,106 @@ void mu2000::tx_line(int state)
 // 0x042932 で 0xF5 を見て次のバイトを「今の口」として覚え、以後のバイトを
 // その口として 0x04437C へ渡す。口は 1 始まり（1=A 2=B 3=C 4=D）
 
+namespace {
+// MIDI の 1 メッセージの長さ。先頭のバイトで決まる。
+// システムエクスクルーシブ（0xf0）は終わりのバイトまで数えないと分からないので
+// 別扱い（下の usb_midi_in を参照）
+int usb_midi_msg_len(u8 status)
+{
+	switch (status & 0xf0) {
+	case 0xc0: case 0xd0: return 2;
+	case 0xf0:
+		switch (status) {
+		case 0xf1: case 0xf3: return 2;
+		case 0xf2:            return 3;
+		default:              return 1;   // リアルタイム（0xf8 以上）や単発
+		}
+	default: return 3;
+	}
+}
+// ノートオン/オフだけ true。ベロシティ 0 のノートオンも実際には「離す」なので、
+// 遅れて困るのは同じ側。優先させる
+bool usb_midi_is_note(const std::vector<u8> &m)
+{
+	if (m.empty())
+		return false;
+	const u8 s = m[0] & 0xf0;
+	return s == 0x80 || s == 0x90;
+}
+} // namespace
+
 void mu2000::usb_midi_in(u8 byte, int port)
 {
 	usb_line &u = m_usb;
-	if (u.rx.size() >= MIDI_QUEUE_LIMIT) {
+	if (port < 0 || port >= 4)
+		port = 0;
+
+	if (u.queued() >= MIDI_QUEUE_LIMIT) {
 		m_midi_dropped.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
-	if (port != u.in_port) {
-		u.rx.push_back(0xf5);
-		u.rx.push_back(u8(port + 1));
-		u.in_port = port;
+
+	// リアルタイム（0xf8 以上）は単発。組み立て中のメッセージの外に割り込んでも
+	// よい種類なので、そのまま 1 バイトのメッセージとして扱う
+	if (byte >= 0xf8) {
+		u.rx.push_back({ u8(port), { byte } });
+		return;
 	}
-	u.rx.push_back(byte);
+
+	std::vector<u8> &acc = u.partial[port];
+	int &want = u.partial_want[port];
+
+	if (byte & 0x80) {
+		// 新しいステータス。組み立てかけのものがあれば諦めて捨てる
+		// （実機の SCI も、次のステータスが来た時点で前のはランニングステータスの
+		// 更新として扱われるだけで、半端なデータは残らない）
+		if (byte == 0xf0) {
+			// システムエクスクルーシブは終わりの 0xf7 まで長さが分からないので、
+			// 専用の書き方にする。優先度は低いほう（rx）でよい
+			acc.clear();
+			acc.push_back(byte);
+			want = -1;             // -1 は「0xf7 待ち」の印
+			u.running[port] = 0;
+			return;
+		}
+		acc.clear();
+		acc.push_back(byte);
+		want = usb_midi_msg_len(byte);
+		if (byte < 0xf0)
+			u.running[port] = byte;    // チャンネルメッセージだけランニングステータスに残す
+		else
+			u.running[port] = 0;       // システムの他のバイトは残さない
+	} else {
+		if (want == -1) {
+			// システムエクスクルーシブの続き
+			acc.push_back(byte);
+			return;
+		}
+		if (acc.empty()) {
+			// ランニングステータスでデータバイトだけ来た
+			if (!u.running[port])
+				return;                // 何のメッセージか分からない。捨てる
+			acc.push_back(u.running[port]);
+			want = usb_midi_msg_len(u.running[port]);
+		}
+		acc.push_back(byte);
+	}
+
+	if (want == -1) {
+		if (byte == 0xf7) {
+			u.rx.push_back({ u8(port), std::move(acc) });   // SysEx は CC などと同じ扱いでよい
+			acc.clear();
+			want = 0;
+		}
+		return;
+	}
+
+	if (want > 0 && int(acc.size()) >= want) {
+		auto &q = usb_midi_is_note(acc) ? u.rx_hi : u.rx;
+		q.push_back({ u8(port), std::move(acc) });
+		acc.clear();
+		want = 0;
+	}
 }
 
 void mu2000::usb_step(u64 now)
@@ -931,21 +1018,49 @@ void mu2000::usb_step(u64 now)
 
 	// USB を使っていないときは何もしない。割り込みを上げると firmware の
 	// USB ドライバが動き出してしまう
-	if (!m_usb_host && u.rx.empty() && !u.have)
+	if (!m_usb_host && u.rx_hi.empty() && u.rx.empty() && u.cur_msg.empty() && !u.have)
 		return;
+
+	// **S-MU2000 patch**: 送っている最中のメッセージ（cur_msg）がなければ、
+	// 次に何を出すかをここで選ぶ。ノートオン/オフ（rx_hi）を CC などの一般の
+	// メッセージ（rx）より先に選ぶことで、CC を大量に流していても
+	// ノートオフが後ろで長く待たされない。速さそのもの（下の USB_BYTE_CYCLES）
+	// は実測どおりのまま変えていない。
+	//
+	// F5 <口> は、firmware が覚えている口（u.in_port、1 本だけ）と、これから
+	// 出すメッセージの口を、送り出す**その時点**で比べて要るときだけ挟む。
+	// 2 本のキューを優先度で行き来しても、firmware から見た口の並びは
+	// 実際に出た順のままなので、どちらのキューから来たかに関わらず正しい
+	if (u.cur_msg.empty() && (!u.rx_hi.empty() || !u.rx.empty())) {
+		const bool from_hi = !u.rx_hi.empty();
+		usb_line::qmsg msg = std::move(from_hi ? u.rx_hi.front() : u.rx.front());
+		if (from_hi) u.rx_hi.pop_front(); else u.rx.pop_front();
+		if (msg.port != u.in_port) {
+			u.cur_msg.push_back(0xf5);
+			u.cur_msg.push_back(u8(msg.port + 1));
+			u.in_port = msg.port;
+		}
+		for (u8 b : msg.bytes)
+			u.cur_msg.push_back(b);
+	}
 
 	// 受信。1 バイト渡すごとに IRQ3（ベクタ 67）を上げる。
 	// 間隔は実機で測った USB の実効帯域 19,500 byte/s に合わせる
 	// （doc/dump/usb.md の実測）。DIN の 3,125 byte/s より 6 倍速いが、
 	// 発音の間隔は firmware 側が頭打ちなので実測とは食い違わない。
 	// 4 つの口が 1 本の流れを分け合うので、遅くすると互いに待たせてしまう
-	if (!u.have && now >= u.next && (!u.cmd.empty() || !u.rx.empty())) {
+	if (!u.have && now >= u.next && (!u.cmd.empty() || !u.cur_msg.empty())) {
 		// コマンドを先に渡す
-		std::deque<u8> &q = u.cmd.empty() ? u.rx : u.cmd;
-		u.cur_cmd = !u.cmd.empty();
-		u.cur  = q.front();
+		const bool from_cmd = !u.cmd.empty();
+		u.cur_cmd = from_cmd;
+		if (from_cmd) {
+			u.cur = u.cmd.front();
+			u.cmd.pop_front();
+		} else {
+			u.cur = u.cur_msg.front();
+			u.cur_msg.erase(u.cur_msg.begin());
+		}
 		u.have = true;
-		q.pop_front();
 		u.next = now + (m_fast_midi ? 0 : USB_BYTE_CYCLES);
 	}
 	// 送信の線を一度下ろす。下で上げ直すので、山は 1 標本ぶんになる
@@ -2297,20 +2412,46 @@ void mu2000::state(state_io &s)
 	}
 
 	// 版 7 から: USB の口（C・D）の受け取り途中。firmware へ渡す前のバイト列
+	//
+	// S-MU2000 patch: rx が rx_hi/rx の 2 本と cur_msg に分かれたので、
+	// 保存するときは 3 つとも 1 本のバイト列に平らにする（F5 の位置を含めて
+	// そのまま）。読み込むときは全部 cur_msg に戻す。優先度の分け直しは
+	// 次に usb_midi_in へ来る新しいメッセージからでよく、戻した直後の
+	// 並びは保存前と 1 バイトも変わらない
 	if (s.version() >= 7) {
 		s.tag("usb");
-		u32 n = u32(m_usb.rx.size());
-		s.v(n);
 		if (s.writing()) {
-			for (u8 b : m_usb.rx)
+			std::vector<u8> flat(m_usb.cur_msg.begin(), m_usb.cur_msg.end());
+			// F5 込みで書き出す。読み戻すときに口の違いを見て自分で挟み直す
+			int last_port = m_usb.in_port;
+			auto emit = [&](const usb_line::qmsg &m) {
+				if (m.port != last_port) {
+					flat.push_back(0xf5);
+					flat.push_back(u8(m.port + 1));
+					last_port = m.port;
+				}
+				flat.insert(flat.end(), m.bytes.begin(), m.bytes.end());
+			};
+			for (const auto &m : m_usb.rx_hi) emit(m);
+			for (const auto &m : m_usb.rx)    emit(m);
+			u32 n = u32(flat.size());
+			s.v(n);
+			for (u8 b : flat)
 				s.v(b);
 		} else {
+			u32 n = 0;
+			s.v(n);
+			m_usb.rx_hi.clear();
 			m_usb.rx.clear();
+			m_usb.cur_msg.clear();
 			for (u32 i = 0; i < n && s.ok(); i++) {
 				u8 b = 0;
 				s.v(b);
-				m_usb.rx.push_back(b);
+				m_usb.cur_msg.push_back(b);
 			}
+			for (u8 &r : m_usb.running) r = 0;
+			for (auto &p : m_usb.partial) p.clear();
+			for (int &w : m_usb.partial_want) w = 0;
 		}
 		s.v(m_usb.in_port); s.v(m_usb.next); s.v(m_usb.have); s.v(m_usb.cur); s.v(m_usb.tx_next);
 		if (s.version() >= 10) {
