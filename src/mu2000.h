@@ -171,7 +171,7 @@ public:
 	}
 	size_t midi_pending() const
 	{
-		size_t pending = m_usb.rx.size() + (m_usb.have ? 1 : 0);
+		size_t pending = m_usb.queued() + (m_usb.have ? 1 : 0);
 		for (const midi_line &m : m_midi)
 			pending += m.queue.size() + (!m_fast_midi && m.bit >= 0 ? 1 : 0);
 		if (m_fast_midi)
@@ -212,7 +212,11 @@ public:
 	// A・B も USB 側を通る（実機で DIN が黙るのと同じ）
 	void set_usb_host(bool on) { m_usb_host = on; }
 	bool usb_host() const { return m_usb_host; }
-	bool usb_idle() const { return m_usb.rx.empty() && m_usb.cmd.empty() && !m_usb.have; }
+	bool usb_idle() const
+	{
+		return m_usb.rx_hi.empty() && m_usb.rx.empty() && m_usb.cur_msg.empty() &&
+		       m_usb.cmd.empty() && !m_usb.have;
+	}
 	// firmware が USB へ出したバイト。口は 0 始まり（-1 は口の指定より前）
 	bool usb_out_take(u8 &v, int &port);
 
@@ -599,9 +603,24 @@ private:
 	bool m_fast_midi = false;
 
 	// USB の代役。SH-2 から見えるのは 2 番地だけなので、持つものも少ない
+	//
+	// S-MU2000 patch: ノートオン/オフを CC などより先に出す。
+	// 実機は 1 本の直列なので、CC を大量に流すとノートオフがその後ろに並んで
+	// 遅れ、離すタイミングが伸び縮みして聞こえる（音は 1 つも欠けない）。
+	// ここでは「今まさに送っているバイトの続き」だけは順序を守り、
+	// まだ送り始めていないメッセージは、鍵の上げ下げを CC より先に選ぶ。
+	// 待ち時間そのもの（バイト数 ÷ 19,500）は変えない。実機と違うのは
+	// 順番だけで、単位時間に運べるバイト数は変えていない
 	struct usb_line {
-		std::deque<u8> rx;      // F5 <口> を挟んだ MIDI バイト列
-		int  in_port  = -1;     // 溜めに積んだ最後の口（F5 を挟む判断に使う）
+		// 完成したメッセージ単位で 2 本に分ける。rx_hi はノートオン/オフ、
+		// rx はそれ以外（CC・ベンド・プログラム・SysEx・リアルタイム）。
+		// メッセージには「送るべき口」を添えておき、F5 <口> は**実際に
+		// 送り出す直前**、firmware がいま覚えている口（in_port、1 本だけ）
+		// と比べて要るときだけ挟む。2 本のキューを行き来しても、firmware から
+		// 見えるのは常に正しい直近の口なので取り違えない
+		struct qmsg { u8 port; std::vector<u8> bytes; };
+		std::deque<qmsg> rx_hi, rx;
+		int  in_port  = -1;     // firmware に最後に伝えた口（F5 の要不要はこれだけで決める）
 		u64  next     = 0;      // 次のバイトを渡してよい時刻
 		bool have     = false;  // 渡したバイトをまだ読まれていない
 		u8   cur      = 0;
@@ -610,6 +629,22 @@ private:
 		u64  tx_next  = 0;
 		std::deque<u8> tx;      // firmware が出した MIDI バイト（F5 込み）
 		int  out_port = -1;     // 取り出し側が見ている口
+
+		// 送っている最中のメッセージの残りバイト（口の切り替え印を先頭に含めることがある）
+		std::deque<u8> cur_msg;
+
+		// 組み立て中（まだ全バイトが揃っていない）メッセージ。ポートごとのランニングステータス
+		u8  running[4] = {};
+		std::vector<u8> partial[4];   // 今組み立てている 1 メッセージ分
+		int partial_want[4] = {};     // 揃うべき長さ（0 なら未確定、-1 は SysEx 途中）
+
+		size_t queued() const
+		{
+			size_t n = cur_msg.size();
+			for (const auto &m : rx_hi) n += m.bytes.size();
+			for (const auto &m : rx)    n += m.bytes.size();
+			return n;
+		}
 	};
 	void usb_midi_in(u8 byte, int port);
 	// ケーブルメッセージ（midi_in の説明）。入口ごとに、いま回している口と、F5 の後の番号待ち
