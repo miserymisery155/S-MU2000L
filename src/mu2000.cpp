@@ -1009,43 +1009,48 @@ void mu2000::usb_midi_in(u8 byte, int port)
 	 	want = 0;
 	 }
 }
-
 void mu2000::usb_step(u64 now)
 {
 	usb_line &u = m_usb;
 	if (!m_usb_host && u.rx_hi.empty() && u.rx.empty() && u.cur_msg.empty() && !u.have)
 	 	return;
 
-	// S-MU2000 patch: Bandwidth Reservation for CC/Expression.
-	// Instead of strict priority which starves CCs, we reserve ~10% of the bandwidth
-	// for rx (CCs) when both queues are busy. This ensures expression stays tight
-	// even during dense note traffic.
-	static int usb_bw_counter = 0;
-	constexpr int USB_BW_RESERVE = 10; // Send 1 CC for every 10 messages
+	// S-MU2000 patch: "Instant USB" mode. If enabled, we bypass the 19,500 B/s
+	// serial simulation and inject messages directly into the firmware's input
+	// register as fast as they arrive, prioritizing notes over CCs.
+	if (u.fast_usb) {
+		if (u.have) return; // Wait for firmware to read the current byte
 
-	if (u.cur_msg.empty() && (!u.rx_hi.empty() || !u.rx.empty())) {
-		bool from_hi = true;
-		
-		if (u.rx_hi.empty()) {
-			from_hi = false;
-		} else if (!u.rx.empty()) {
-			// If rx has been waiting longer than 2ms, force it through regardless of counter
-			// to prevent absolute starvation in edge cases
-			if (now - u.rx.front().timestamp >= 28000000 / 500) { 
-				from_hi = false;
-				usb_bw_counter = 0; // Reset counter on forced send
-			} 
-			// Otherwise, use bandwidth reservation
-			else if (++usb_bw_counter >= USB_BW_RESERVE) {
-				from_hi = false;
-				usb_bw_counter = 0;
+		if (u.cur_msg.empty() && (!u.rx_hi.empty() || !u.rx.empty())) {
+			const bool from_hi = !u.rx_hi.empty();
+			usb_line::qmsg msg = std::move(from_hi ? u.rx_hi.front() : u.rx.front());
+			if (from_hi) u.rx_hi.pop_front(); else u.rx.pop_front();
+
+			// Handle port switching (F5) instantly
+			if (msg.port != u.in_port) {
+				u.cur_msg.push_back(0xf5);
+				u.cur_msg.push_back(u8(msg.port + 1));
+				u.in_port = msg.port;
 			}
+			for (u8 b : msg.bytes)
+				u.cur_msg.push_back(b);
 		}
 
+		if (!u.cur_msg.empty()) {
+			u.cur = u.cur_msg.front();
+			u.cur_msg.pop_front();
+			u.have = true;
+			u.next = now; // Ready for next byte immediately
+			m_cpu->execute_set_input(3, 1); // Trigger IRQ instantly
+		}
+		return;
+	}
+
+	// Standard 19,500 B/s emulation (original behavior)
+	if (u.cur_msg.empty() && (!u.rx_hi.empty() || !u.rx.empty())) {
+		const bool from_hi = !u.rx_hi.empty();
 		usb_line::qmsg msg = std::move(from_hi ? u.rx_hi.front() : u.rx.front());
 		if (from_hi) u.rx_hi.pop_front(); else u.rx.pop_front();
-		
-		// Handle port switching (F5)
 		if (msg.port != u.in_port) {
 			u.cur_msg.push_back(0xf5);
 			u.cur_msg.push_back(u8(msg.port + 1));
@@ -1055,13 +1060,7 @@ void mu2000::usb_step(u64 now)
 			u.cur_msg.push_back(b);
 	}
 
-	// 受信。1 バイト渡すごとに IRQ3（ベクタ 67）を上げる。
-	// 間隔は実機で測った USB の実効帯域 19,500 byte/s に合わせる
-	// （doc/dump/usb.md の実測）。DIN の 3,125 byte/s より 6 倍速いが、
-	// 発音の間隔は firmware 側が頭打ちなので実測とは食い違わない。
-	// 4 つの口が 1 本の流れを分け合うので、遅くすると互いに待たせてしまう
 	if (!u.have && now >= u.next && (!u.cmd.empty() || !u.cur_msg.empty())) {
-		// コマンドを先に渡す
 		const bool from_cmd = !u.cmd.empty();
 		u.cur_cmd = from_cmd;
 		if (from_cmd) {
@@ -1075,20 +1074,11 @@ void mu2000::usb_step(u64 now)
 		u.next = now + (m_fast_midi ? 0 : USB_BYTE_CYCLES);
 	}
 
-	// 送信の線を一度下ろす。下で上げ直すので、山は 1 標本ぶんになる
 	m_cpu->execute_set_input(2, 0);
 
-	// **読まれるまで上げておく**。実機の M37640 は「受信あり」を線で示しているので、
-	// firmware が受け取りを止めている間に来たバイトも、止めるのをやめた時点で必ず拾われる。
-	// 渡した瞬間に 1 回だけ上げる形にしていたため、firmware が受信を詰まらせて
-	// IRQ3 の優先度を 0 に落としている隙に渡すと、優先度を戻しても二度と上がらず、
-	// 以後 MIDI を 1 バイトも受け取らなくなっていた（USB の口へ 1 秒に 2 万バイト近い
-	// 設定データを流すと起きる。X で報告された testxg.mid）
 	if (u.have)
 		m_cpu->execute_set_input(3, 1);
 
-	// 送信。firmware は IRQ2（ベクタ 66）が来るたびに 1 バイト出す。
-	// 上げないとリングが埋まり、0x437A0 の空き待ちで固まる（実機でやらかした）
 	if (now >= u.tx_next) {
 		u.tx_next = now + USB_BYTE_CYCLES;
 		m_cpu->execute_set_input(2, 1);
