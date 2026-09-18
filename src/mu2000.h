@@ -211,6 +211,7 @@ public:
 	// この口を使うなら set_usb_host(true) を**起動前に**呼ぶこと。そのときは
 	// A・B も USB 側を通る（実機で DIN が黙るのと同じ）
 	void set_usb_host(bool on) { m_usb_host = on; }
+	void set_usb_instant(bool on) { m_usb.fast_usb = on; }
 	bool usb_host() const { return m_usb_host; }
 	bool usb_idle() const
 	{
@@ -643,7 +644,7 @@ private:
 		u8  running[4] = {};
 		std::vector<u8> partial[4];   // 今組み立てている 1 メッセージ分
 		int partial_want[4] = {};     // 揃うべき長さ（0 なら未確定、-1 は SysEx 途中）
-		u64  rx_last_starvation = 0;  // rx キューが飢餓回避のために最後に送出された時刻
+		bool fast_usb = false;        // S-MU2000: USB シリアル遅延をスキップするか
 		size_t queued() const
 		{
 			size_t n = cur_msg.size();
