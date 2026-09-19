@@ -142,8 +142,18 @@ std::vector<xg::nv::voice_cal> take_cals(mu2000 &mu, const u8 *rom, u32 rec,
 			}
 		}
 		const u8 *el = xg::nv::element(rom, rec, idx);
-		cal.base_level = xg::nv::calibrate_level(rom, el,
-		    cal.has(9) ? (cal.reg[9] & 0xff) : mu.nvram()[0x3e96a], note, vel);
+		// **音量の目盛りは実機のボイスの塊から直に取る**（doc の 6.102）。
+		// 取れているかは、写し取った 0x09 と組み直した値が合うかで見る
+		{
+			const int att_ref = cal.has(9) ? (cal.reg[9] & 0xff) : mu.nvram()[0x3e96a];
+			const int rest = xg::nv::volume_rest(rom, el, note, vel);
+			const int fwl = xg::nv::fw_voice_level(mu.nvram().data(), ch);
+			cal.base_level =
+			    (fwl > 0 && xg::nv::volume_att_from(rom, fwl, rest,
+			                                        xg::nv::VOL_GAIN_DEF) == att_ref)
+			    ? xg::nv::base_level_from_fw(rom, el, fwl, note)
+			    : xg::nv::calibrate_level(rom, el, att_ref, note, vel);
+		}
 		cal.have = true;
 		out.push_back(cal);
 	}

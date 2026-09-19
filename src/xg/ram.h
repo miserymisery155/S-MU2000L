@@ -21,6 +21,25 @@ namespace ram {
 
 // ワーク RAM の先頭（0x400000）からの位置
 constexpr u32 SYSTEM   = 0x226c1;   // 00 00 00-06
+constexpr u32 SYS_VOLUME    = SYSTEM + 4;   // 00 00 04（マスター音量）
+constexpr u32 SYS_TRANSPOSE = SYSTEM + 6;   // 00 00 06（64 が 0 半音）
+// **ドラムセットアップ**（XG の `3n rr nn`）。SysEx を書いて、書かれた番地を
+// 見て並びを割り出した（`3n` が組 0-3、`rr` が鍵 13-91、`nn` がパラメータ 0-22）:
+//   0x30 24 00 -> 4228F2   0x30 24 02 -> 4228F4   0x30 25 02 -> 42290B（+23）
+//   0x30 26 02 -> 422922   0x31 24 02 -> 42300D（+1817 = 23*79）
+//   0x30 0D 02 -> 4226E3
+constexpr u32 DRUM_SETUP       = 0x226e1;   // 組 0・鍵 13・パラメータ 0
+constexpr u32 DRUM_SETUP_PARAM = 23;
+constexpr u32 DRUM_SETUP_NOTES = 79;
+constexpr int DRUM_SETUP_NOTE0 = 13;
+constexpr int DRUM_SETUP_SETS  = 4;
+
+inline u32 drum_setup(int set, int note, int param)
+{
+	return DRUM_SETUP + u32(set) * DRUM_SETUP_PARAM * DRUM_SETUP_NOTES
+	     + u32(note - DRUM_SETUP_NOTE0) * DRUM_SETUP_PARAM + u32(param);
+}
+
 constexpr u32 VOICE_MODE = 0x226bc; // 音色の引き方（1 が XG）。xg/voices.h の lookup に渡す
 constexpr u32 VOICE_SET  = 0x226de; // 音色の組の選び方（MU2000 の音色なら 1）
 constexpr u32 EFFECT   = 0x0cad8;   // 02 01 00 から。下の EFFECTS の並び

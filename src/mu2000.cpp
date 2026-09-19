@@ -471,11 +471,21 @@ void mu2000::build_bus()
 			note(a, v, 4);
 			return v;
 		};
-		// SMU2000_RAMWRITE=<番地16進> で、その番地に**書いた**命令の番地を出す
+		// SMU2000_RAMWRITE=<番地16進>[:<長さ16進>] で、その範囲に**書いた**命令の
+		// 番地を出す。長さを付けると、どのバイトが動いたか分からないときに
+		// 塊ごと見張れる（マスター移調を探すときに要った）
 		const char *wp = std::getenv("SMU2000_RAMWRITE");
-		const u32 wa = wp ? u32(std::strtoul(wp, nullptr, 16)) : 0xffffffffu;
-		auto notew = [this, wa](offs_t a, u32 v, int size) {
-			if (a <= wa && wa < a + u32(size))
+		u32 wa = 0xffffffffu, wlen = 1;
+		if (wp) {
+			char *end = nullptr;
+			wa = u32(std::strtoul(wp, &end, 16));
+			if (end && *end == ':')
+				wlen = u32(std::strtoul(end + 1, nullptr, 16));
+			if (!wlen)
+				wlen = 1;
+		}
+		auto notew = [this, wa, wlen](offs_t a, u32 v, int size) {
+			if (a < wa + wlen && wa < a + u32(size))
 				std::fprintf(stderr, "ramwrite s=%llu pc=%06x 番地=%06x = %x (%d bit)\n",
 				             (unsigned long long)trace_sample(),
 				             m_cpu ? m_cpu->pc() : 0, u32(a), v, size * 8);
@@ -1298,7 +1308,8 @@ void mu2000::native_learn_start(u32 rec)
 		int n = 0;
 		const int nel = xg::nv::element_count(rom0, rec);
 		for (int k = 0; k < nel; k++)
-			if (xg::nv::element_active(xg::nv::element(rom0, rec, k), m_learn_note, m_learn_vel))
+			if (xg::nv::element_active(xg::nv::element(rom0, rec, k), learn_note_shifted(),
+			                           learn_vel_sensed()))
 				n++;
 		if (n > 0)
 			m_learn_want = n;
@@ -1400,8 +1411,8 @@ void mu2000::native_learn_finish()
 				continue;
 			if (int(cals.size()) >= m_learn_want)
 				break;
-			cal.cal_vel  = m_learn_vel;
-			cal.cal_note = m_learn_note;
+			cal.cal_vel  = learn_vel_sensed();
+			cal.cal_note = learn_note_shifted();
 			cal.cal_vol  = m_ndrv.part_vol(m_learn_part);
 			cal.cal_expr = m_ndrv.part_expr(m_learn_part);
 			cal.cal_pan  = m_ndrv.part_pan(m_learn_part);
@@ -1460,7 +1471,8 @@ void mu2000::native_learn_finish()
 				if (used_elem & (1u << k))
 					continue;
 				const u8 *e2 = xg::nv::element(rom, m_learn_rec, k);
-				const u8 *w2 = xg::nv::wave_entry(rom, xg::nv::wave_set(e2), xg::nv::wave_note(e2, m_learn_note));
+				const u8 *w2 = xg::nv::wave_entry(rom, xg::nv::wave_set(e2),
+				                                  xg::nv::wave_note(e2, learn_note_shifted()));
 				if (w2 && xg::nv::read_wave(w2).format_addr == want) {
 					idx = k;
 					used_elem |= 1u << k;
@@ -1480,15 +1492,36 @@ void mu2000::native_learn_finish()
 			}
 			idx = int(cals.size()) < nel ? int(cals.size()) : 0;
 		}
-		cal.base_level = xg::nv::calibrate_level(rom, xg::nv::element(rom, m_learn_rec, idx),
-		                                         cal.has(9) ? (cal.reg[9] & 0xff) : 64,
-		                                         m_learn_note, m_learn_vel);
+		// **音量の目盛りは実機の塊から直に取る**（6.101）。減衰の表は同じ値が
+		// 3-4 段つづくので、減衰から目盛りを逆に引くと幅でしか分からない。
+		// 掛ける前の目盛りは実機がボイスの塊 +118 に持っているので、それを
+		// そのまま使えば当て推量が要らない。取れなければ逆引きに落とす
+		{
+			const u8 *el0 = xg::nv::element(rom, m_learn_rec, idx);
+			const int att_ref = cal.has(9) ? (cal.reg[9] & 0xff) : 64;
+			const int gain = m_ndrv.vol_gain_of(m_learn_part,
+			                                    m_ndrv.part_vol(m_learn_part),
+			                                    m_ndrv.part_expr(m_learn_part));
+			const int rest = xg::nv::volume_rest(rom, el0, learn_note_shifted(),
+			                                     learn_vel_sensed());
+			const int fwl = xg::nv::fw_voice_level(m_ram.data(), ch);
+			// **検算**: 読んだ目盛りから組み直した減衰が、実機が書いた 0x09 と
+			// 合うか。合わなければ塊が別の声のものなので、逆引きに落とす
+			const bool good = fwl > 0 &&
+			    xg::nv::volume_att_from(rom, fwl, rest, gain) == att_ref;
+			cal.base_level = good
+			    ? xg::nv::base_level_from_fw(rom, el0, fwl, learn_note_shifted())
+			    : xg::nv::calibrate_level(rom, el0, att_ref, learn_note_shifted(),
+			                              learn_vel_sensed(), gain);
+			if (!good && fwl > 0)
+				m_ne_lvl_miss++;
+		}
 		// **減衰の目盛りのずれを覚える**。実機が書いた 0x07・0x08 の上位から
 		// 目盛りを引き直し、こちらの式で出した目盛りとの差を取る。
 		// 同じ値が並ぶ表なので、こちらの目盛りにいちばん近いものを選ぶ
 		{
 			const u8 *el2 = xg::nv::element(rom, m_learn_rec, idx);
-			const int corr2 = xg::nv::rate_key_corr(el2, m_learn_note);
+			const int corr2 = xg::nv::rate_key_corr(el2, learn_note_shifted());
 			const int raw[2] = { int(el2[74]), int(el2[75]) };
 			for (int k = 0; k < 2; k++) {
 				if (!cal.has(0x07 + k))
@@ -1507,7 +1540,7 @@ void mu2000::native_learn_finish()
 			}
 		}
 		cal.cal_vel  = m_learn_vel;
-		cal.cal_note = m_learn_note;
+		cal.cal_note = learn_note_shifted();
 		cal.cal_vol  = m_ndrv.part_vol(m_learn_part);
 		cal.cal_expr = m_ndrv.part_expr(m_learn_part);
 		cal.cal_pan  = m_ndrv.part_pan(m_learn_part);

@@ -518,6 +518,19 @@ private:
 	u32  m_ne_learn_dirty = 0;
 	// 写し取りで、その音色のものでないスロットを掴んで捨てた回数
 	u32  m_ne_learn_wrong = 0;
+	// **写し取りの鍵**。firmware は XG のノートシフト（08 pp 08）を足して
+	// から鳴らすので、こちらの式もその鍵で見ないと合わない
+	// **写し取りの強さ**。firmware はベロシティ感度（08 pp 0C・0D）を掛けて
+	// から鳴らすので、こちらの式もその強さで見る
+	int  learn_vel_sensed() const
+	{ return m_ndrv.part_vel(m_learn_part, m_learn_vel); }
+	int  learn_note_shifted() const
+	{
+		const int n = m_learn_note + m_ndrv.part_shift(m_learn_part);
+		return n < 0 ? 0 : (n > 127 ? 127 : n);
+	}
+	// 実機のボイスの塊から読んだ音量の目盛りが、写し取った 0x09 と合わなかった数
+	u32  m_ne_lvl_miss = 0;
 	// firmware が、こちらが鳴らしているスロットに書いた回数
 	u32  m_ne_fw_stomp = 0;
 	void note_fw_swp(bool master, u32 reg, u16 value);
@@ -530,6 +543,7 @@ public:
 	u32  native_slot_clash() const { return m_ne_slot_clash; }
 	u32  native_learn_dirty() const { return m_ne_learn_dirty; }
 	u32  native_learn_wrong() const { return m_ne_learn_wrong; }
+	u32  native_level_miss() const { return m_ne_lvl_miss; }
 	u32  native_fw_stomp() const { return m_ne_fw_stomp; }
 private:
 	native_stats m_ne_stats;

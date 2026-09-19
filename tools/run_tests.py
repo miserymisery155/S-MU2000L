@@ -259,6 +259,7 @@ SHAPE_MIN = {
     "piano":   0.98, "chord":  0.95, "drums": 0.85, "effects": 0.98,
     "dense":   0.40, "port_b": 0.98, "bend":  0.98, "lofi":    0.98,
     "egcc":    0.98, "porta":  0.38, "at":    0.95, "sxparam": 0.95,
+    "pedals":  0.95, "partsx": 0.95,
 }
 
 
