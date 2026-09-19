@@ -22,6 +22,7 @@
 #include "mame/video/hd44780.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <cstring>
 #include <atomic>
@@ -402,8 +403,22 @@ private:
 	// 内訳: MIDI は 1 バイト 10 ビット・31250 baud なので 14.1 サンプルかかる。
 	// 3 バイトの鍵で 42 サンプル、残り 32 サンプルが firmware の中の手間
 	static constexpr u32 NATIVE_DELAY = 74;
-	static constexpr u32 NATIVE_PROC  = 32;          // バイトを受け終えてから鳴るまで
-	static constexpr u64 RX_BYTE_TICK = 903;         // 1 バイト（1/64 サンプル単位）
+	// **バイトを受け終えてから鳴るまで**。`SMU2000_NATIVE_PROC` で振れる
+	// （キーオンの時刻を実機と合わせる調べもの用。doc の 6.73）
+	static u32 native_proc()
+	{
+		static const u32 v = std::getenv("SMU2000_NATIVE_PROC")
+		                   ? u32(std::atoi(std::getenv("SMU2000_NATIVE_PROC"))) : 32;
+		return v;
+	}
+	// 1 バイト（1/64 サンプル単位）。`SMU2000_RX_BYTE` で振れる（0 にすると
+	// 和音の音が全部同じ時刻に出る。相対のずれを調べる用。doc の 6.78）
+	static u64 rx_byte_tick()
+	{
+		static const u64 v = std::getenv("SMU2000_RX_BYTE")
+		                   ? u64(std::atoi(std::getenv("SMU2000_RX_BYTE"))) : 903;
+		return v;
+	}
 	u64  m_rx_at[MIDI_PORTS] = {};                   // その口が次のバイトを受け終える時刻
 	// kind 0=離し 1=押し 2=CC 3=ベンド 4=音色の指定 5=XG のパートの設定（08 pp d0=d1）
 	struct nev { u64 at; u8 kind, part, d0, d1; };
@@ -457,8 +472,8 @@ private:
 		const u64 now = m_ne_clock * 64;
 		if (m_rx_at[port] < now)
 			m_rx_at[port] = now;
-		m_rx_at[port] += RX_BYTE_TICK;
-		return m_rx_at[port] / 64 + NATIVE_PROC;
+		m_rx_at[port] += rx_byte_tick();
+		return m_rx_at[port] / 64 + native_proc();
 	}
 	bool nown(int part, int note) const
 	{ return (m_nown[part][(note >> 5) & 3] & (u32(1) << (note & 31))) != 0; }

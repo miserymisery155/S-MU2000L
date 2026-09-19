@@ -1281,6 +1281,9 @@ void mu2000::set_native_engine(int mode)
 			             (unsigned long long)trace_sample());
 		m_swpm.write16(reg, value);
 	});
+	// **チップの「音程の包絡線が着いた」印**を native の口にも見せる。
+	// 実機の firmware も内部レジスタ 4 の bit14 で同じものを見ている（0x12B81C）
+	m_ndrv.set_peg_peek([this](int chan) { return m_swpm.peg_reached(chan); });
 }
 
 // 音色の 1 音目を firmware に鳴らさせて、スロットに書かれた値を写し取る

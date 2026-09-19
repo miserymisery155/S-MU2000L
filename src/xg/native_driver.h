@@ -93,6 +93,11 @@ public:
 		// あとはチップに任せる（doc/native-engine.md の 6.68）。
 		// 0xffff は「書くものが無い」の印
 		u16 peg_tgt = 0xffff;
+		// **音程の包絡線の段**（0 が押した直後の段。3 で終わり）。
+		// チップが行き先に着いたら次の段を張る（doc の 6.80）
+		int pstage = 3;
+		int pvel = 100;
+		u64 pnext = 0;              // つぎに着いたか見る時刻
 		s32 glide = 0, glide_step = 0;
 		u64 glide_next = 0;
 		u64 age = 0;
@@ -102,6 +107,10 @@ public:
 	using poke_fn = std::function<void(u32 reg, u16 value)>;
 
 	void set_poke(poke_fn f) { m_poke = std::move(f); }
+	// **チップの「音程の包絡線が着いた」印を覗く**。実機の firmware も
+	// 内部レジスタ 4 の bit14 で同じものを見ている
+	using peek_fn = std::function<bool(int)>;
+	void set_peg_peek(peek_fn f) { m_peg_peek = std::move(f); }
 	void set_rom(const u8 *rom) { m_rom = rom; }
 	// ワーク RAM（firmware が音色を選んだ結果を読む）
 	void set_ram(const u8 *ram) { m_ram = ram; }
@@ -276,7 +285,10 @@ public:
 		int live = 0;
 		for (int i = 0; i < SLOTS; i++) {
 			slot_use &s = m_slot[i];
-			if (!s.cal)
+			// **写し取りが無くても包絡線は動かす**（`SMU2000_CUT_EXACT=1` のとき）。
+			// 式だけで `0x00` を出せるようになったので、録画は要らない（6.72）
+			if (!s.cal && !(nv::cut_exact() && fenv_on() && s.elem)
+			    && !(s.on && s.pstage < 3 && s.elem && m_peg_peek))
 				continue;
 			// **離しの最中もフィルタを動かす**。実機は離しのあいだも
 			// 0x00・0x01・0x04 を書き続ける（doc/native-engine.md の 6.57）
@@ -293,8 +305,7 @@ public:
 					}
 					if (moved) {
 						s.cut = fenv_cut(s);
-						m_poke(u32(i) * 64 + 0x00,
-						       cutoff_reg(s.cut, *s.cal, s.part, s.elem, s.note));
+						m_poke(u32(i) * 64 + 0x00, cut_with_cc(s, s.cut));
 					}
 					if (s.finc) {
 						live++;
@@ -302,14 +313,18 @@ public:
 							next = s.fnext;
 					}
 				}
+				if (!s.cal)
+					continue;
 				const std::vector<nv::fstep> &re = s.cal->filter_env;
 				while (s.rpos < re.size()) {
 					if (!re[s.rpos].rel) { s.rpos++; continue; }
 					if (u64(s64(s.rel_at + re[s.rpos].at) + EG_LAG) > clock)
 						break;
-					if ((fenv_on() && re[s.rpos].reg == 0x00)
-					    || re[s.rpos].reg == 0x04) {
-						s.rpos++;         // 式で出すので録画の分は捨てる
+					// **式で出せるときだけ録画を捨てる**。ドラムは要素を持たない
+					// ので式が動かない。捨てるとフィルタの包絡線が丸ごと消える
+					if (s.elem && ((fenv_on() && re[s.rpos].reg == 0x00)
+					               || re[s.rpos].reg == 0x04)) {
+						s.rpos++;
 						continue;
 					}
 					u16 v = re[s.rpos].v;
@@ -335,8 +350,20 @@ public:
 				continue;
 			}
 			live++;
+			// **音程の包絡線の段**。チップが行き先に着いていたら次の段を張る
+			if (s.pstage < 3 && s.elem && m_peg_peek) {
+				while (clock >= s.pnext) {
+					if (m_peg_peek(i))
+						peg_advance(i);
+					s.pnext += FENV_TICK;
+					if (s.pstage >= 3)
+						break;
+				}
+				if (s.pstage < 3 && s.pnext < next)
+					next = s.pnext;
+			}
 			// **フィルタの包絡線を式で動かす**（録画の代わり）
-			if (fenv_on() && s.cal && s.elem) {
+			if (fenv_on() && s.elem) {
 				bool moved = false;
 				while (clock >= s.fnext) {
 					fenv_step(s);
@@ -345,8 +372,7 @@ public:
 				}
 				if (moved) {
 					s.cut = fenv_cut(s);
-					m_poke(u32(i) * 64 + 0x00,
-					       cutoff_reg(s.cut, *s.cal, s.part, s.elem, s.note));
+					m_poke(u32(i) * 64 + 0x00, cut_with_cc(s, s.cut));
 				}
 				if (s.fnext < next)
 					next = s.fnext;
@@ -354,26 +380,32 @@ public:
 			// ポルタメント: 10ms ごとに残りのずれを step だけ 0 へ寄せて、
 			// 音程のレジスタを書き直す（6.41）
 			if (s.glide && s.elem && s.wave) {
+				bool moved = false;
 				while (s.glide && s.glide_next <= clock) {
 					if (s.glide > 0)
 						s.glide = s.glide > s.glide_step ? s.glide - s.glide_step : 0;
 					else
 						s.glide = -s.glide > s.glide_step ? s.glide + s.glide_step : 0;
 					s.glide_next += nv::PORTA_TICK;
+					moved = true;
 				}
-				m_poke(u32(i) * 64 + 0x11, pitch_of(s));
+				// **動いたときだけ書く**。前は段の輪が回るたびに書いていて、
+				// 1 音の滑りで 0x11 を 26000 回以上書いていた（6.82）
+				if (moved)
+					m_poke(u32(i) * 64 + 0x11, pitch_of(s));
 			}
 			if (s.glide && s.glide_next < next)
 				next = s.glide_next;
-			if (s.tpos >= s.cal->filter_env.size())
+			if (!s.cal || s.tpos >= s.cal->filter_env.size())
 				continue;
 			const std::vector<nv::fstep> &fe = s.cal->filter_env;
 			while (s.tpos < fe.size() && !fe[s.tpos].rel &&
 			       u64(s64(s.tstart + fe[s.tpos].at) + EG_LAG) <= clock) {
 				u16 v = fe[s.tpos].v;
-				if ((fenv_on() && fe[s.tpos].reg == 0x00)
-				    || fe[s.tpos].reg == 0x04) {
-					s.tpos++;          // 式で出すので、録画の分は捨てる
+				// **式で出せるときだけ録画を捨てる**（上の但し書きを見よ）
+				if (s.elem && ((fenv_on() && fe[s.tpos].reg == 0x00)
+				               || fe[s.tpos].reg == 0x04)) {
+					s.tpos++;
 					continue;
 				}
 				if (fe[s.tpos].reg == 0x0a) {      // 深さにモジュレーションを足す
@@ -835,15 +867,26 @@ private:
 			return;
 		s.fvel = vel;
 		s.fadj = nv::fenv_key_adj(s.elem, s.note) + nv::fenv_vel_adj(s.elem, vel);
-		s.facc = nv::fenv_target(m_rom, s.elem, s.elem[55], s.fvel);
-		s.ftgt = s.facc;
+		s.ftgt = nv::fenv_target(m_rom, s.elem, s.elem[55], s.fvel);
+		// **立ち上がりの段**。byte50 が 63（即到達）なら段 0 の行き先から
+		// 始まり、そうでなければ byte54 から byte50 の速さで登る（6.71）
+		s.facc = nv::cut_exact() ? nv::fenv_init(m_rom, s.elem, s.fvel) : s.ftgt;
 		s.finc = 0;
 		s.fstage = 0;
-		fenv_next(s);
+		if (s.facc == s.ftgt) {
+			fenv_next(s);
+		} else {
+			int rate = int(s.elem[50]) + s.fadj;
+			rate = rate < 0 ? 0 : (rate > 63 ? 63 : rate);
+			s.finc = nv::fenv_inc(m_rom, rate);
+			if (s.facc > s.ftgt && s.finc != nv::FENV_NEXT)
+				s.finc = -s.finc;
+		}
 		// **格子の目は録画の 1 段目から取る**。録画の時刻は firmware が
 		// 実際に書いた時刻なので、そこが格子の目そのもの。
 		// 位相を別に測るより、これがいちばん近い（実測で確かめた）
 		u32 at0 = FENV_TICK;
+		if (s.cal)
 		for (const nv::fstep &e : s.cal->filter_env)
 			if (e.reg == 0x00 && !e.rel) { at0 = e.at; break; }
 		// 鍵を押した直後の 1 目は、実機も値を動かさない（張った値を書くだけ）。
@@ -858,7 +901,7 @@ private:
 	void fenv_release(slot_use &s)
 	{
 		const u8 *e = s.elem;
-		if (!e || !m_rom || !fenv_on() || !s.cal)
+		if (!e || !m_rom || !fenv_on())
 			return;
 		int rate = int(e[53]) + s.fadj;
 		if (rate < 0) rate = 0;
@@ -885,8 +928,24 @@ private:
 	}
 
 	// いまの切る高さ（写し取った鍵を押した時点の値を基準に、包絡線の差ぶんを足す）
+	// 写し取りがあれば CC74 の差ぶん、無ければ 64 からの差ぶんを乗せる
+	u16 cut_with_cc(const slot_use &s, u16 base) const
+	{
+		if (s.cal)
+			return cutoff_reg(base, *s.cal, s.part, s.elem, s.note);
+		const int now = m_cc[s.part].bri;
+		if (now < 0 || now == 64)
+			return base;
+		int v = int(base & 0xfff) + nv::bright_shift(now);
+		v = v < 0 ? 0 : (v > nv::CUTOFF_MAX ? nv::CUTOFF_MAX : v);
+		return u16((base & 0xf000) | u16(v));
+	}
+
 	u16 fenv_cut(const slot_use &s) const
 	{
+		// 式だけで出す道（写し取りが無いときは必ずこちら）
+		if (!s.cal || nv::cut_exact())
+			return nv::cutoff_of(m_rom, s.elem, s.note, s.fvel, s.facc);
 		const u16 base = s.cal->reg[0x00];
 		const int init = nv::fenv_target(m_rom, s.elem, s.elem[55], s.fvel) >> 2;
 		int v = int(base & 0xfff) - init + (s.facc >> 2);
@@ -1090,11 +1149,11 @@ public:
 			su.tpos = 0;
 			su.tstart = m_clock;
 			// **フィルタの包絡線を式で動かす**（録画の代わり）
-			if (fenv_on() && c) {
+			if (fenv_on() && (c || nv::cut_exact())) {
 				su.note = note;
 				fenv_start(su, vel);
 			}
-			if (c) {
+			if (c || (nv::cut_exact() && fenv_on()) || m_peg_peek) {
 				m_traj = true;
 				m_traj_next = 0;       // つぎの tick で見直す
 			}
@@ -1111,8 +1170,11 @@ public:
 				if (su.glide_step > 0) {
 					su.glide = (src - note) * nv::key_follow(el) * 256;
 					// firmware の 10ms タイマは世界共通なので、鍵を押した時刻からで
-					// なく**格子**に乗せる（同時に鳴る音の滑りがそろう）
-					su.glide_next = (m_clock / nv::PORTA_TICK + 1) * nv::PORTA_TICK;
+					// なく**格子**に乗せる（同時に鳴る音の滑りがそろう）。
+					// 格子は包絡線と同じ（録画から取った実機の目）を使う（6.82）
+					su.glide_next = su.fnext > nv::PORTA_TICK
+					              ? su.fnext - nv::PORTA_TICK
+					              : (m_clock / nv::PORTA_TICK + 1) * nv::PORTA_TICK;
 				}
 			}
 			nv::slot_regs sr = nv::build_note(m_rom, el, note, note_att(su, part), c,
@@ -1124,6 +1186,15 @@ public:
 				const u16 tgt = nv::peg_reg(m_rom, nv::peg_cents(el, el[31], vel));
 				su.peg_tgt = tgt == sr.v[0x10] ? 0xffff : tgt;
 			}
+			// **段 0 から始める**。実機は 10ms ごとに「着いたか」を見て次の段へ
+			su.pvel = vel;
+			su.pstage = 0;
+			// **刻みはフィルタの包絡線と同じ**（実機はどちらも同じ 10ms の
+			// タイマで動いている）。録画から取った格子に乗せる
+			// フィルタの包絡線は「1 目遅らせて進め始める」ので、こちらは
+			// その 1 目ぶん手前が実機の格子になる（実測で 312 サンプル）
+			su.pnext = su.fnext > FENV_TICK ? su.fnext - FENV_TICK
+			                                : (m_clock / FENV_TICK + 1) * FENV_TICK;
 			if (c && c->has(0x32))
 				sr.set(0x32, pan_reg(*c, part));
 			su.lfo = sr.v[0x0a];
@@ -1197,7 +1268,8 @@ public:
 			s.rel_att = s.att;
 			s.rpos = 0;
 			fenv_release(s);
-			if (s.cal && !s.cal->filter_env.empty()) {
+			if ((s.cal && !s.cal->filter_env.empty())
+			    || (nv::cut_exact() && fenv_on() && s.elem)) {
 				m_traj = true;
 				m_traj_next = 0;
 			}
@@ -1372,6 +1444,25 @@ private:
 				m_poke(u32(slot) * 64 + u32(i), r.v[i]);
 	}
 
+	// **音程の包絡線の段を進める**。チップが行き先に着いていたら、
+	// 次の段の速さ（0x0b）と行き先（0x10）を張る
+	void peg_advance(int i)
+	{
+		slot_use &s = m_slot[i];
+		if (!s.elem || !m_rom)
+			return;
+		s.pstage++;
+		if (s.pstage > 2) {
+			s.pstage = 3;
+			return;
+		}
+		const int rate = nv::peg_rate_reg_stage(m_rom, s.elem, s.pstage, s.note, s.pvel);
+		const int lvl  = nv::peg_level_of(s.elem, s.pstage);
+		m_poke(u32(i) * 64 + 0x0b, u16(rate << 8));
+		m_poke(u32(i) * 64 + 0x10,
+		       nv::peg_reg(m_rom, nv::peg_cents(s.elem, lvl, s.pvel)));
+	}
+
 	void key_on(u64 mask)
 	{
 		static const u32 MASK_REG[4] = { 0x1cf, 0x1ce, 0x18f, 0x18e };
@@ -1391,6 +1482,7 @@ private:
 	}
 
 	poke_fn m_poke;
+	peek_fn m_peg_peek;
 	const u8 *m_rom = nullptr;
 	const u8 *m_ram = nullptr;
 	std::unordered_map<u64, std::vector<nv::voice_cal>> m_cal;
