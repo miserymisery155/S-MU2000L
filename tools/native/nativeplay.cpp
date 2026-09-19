@@ -1965,7 +1965,13 @@ int main(int argc, char **argv)
 		for (u8 b : { u8(0x90), u8(note & 0x7f), u8(vel & 0x7f) })
 			mu.midi_in(b, 0);
 	} else {
+		// **その鍵と強さで実際に鳴る要素**を選ぶ（EPiano1 のように強さで
+		// 要素が切り替わる音色がある。要素 0 で決め打つと測り間違える）
 		const u8 *elem = xg::nv::element(rom, rec, 0);
+		for (int i = 0, n = xg::nv::element_count(rom, rec); i < n; i++) {
+			const u8 *e2 = xg::nv::element(rom, rec, i);
+			if (xg::nv::element_active(e2, note, vel)) { elem = e2; break; }
+		}
 		// 先に 1 音だけ firmware に鳴らしてもらって癖を写し取る
 		const std::vector<u8> before1 = mu.save_state();
 		const xg::nv::voice_cal cal = take_cal(mu, rom, rec, note, vel, RATE);
@@ -1976,7 +1982,8 @@ int main(int argc, char **argv)
 		const int att = xg::nv::volume_att(rom, elem, cal.base_level, note, vel);
 		// --nocal: 写し取りを一切混ぜず、式だけで組む（段 3 の進み具合を測る）
 		xg::nv::slot_regs regs = xg::nv::build_note(rom, elem, note, att,
-		                                            nocal ? nullptr : &cal);
+		                                            nocal ? nullptr : &cal,
+		                                            xg::nv::defaults(), 0, vel);
 		if (copyall) {
 			// 切り分け用: 写し取った値をそのまま全部使う（式を一切使わない）
 			for (int i = 0; i < 0x40; i++)
