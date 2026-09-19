@@ -1308,6 +1308,8 @@ void mu2000::native_learn_start(u32 rec)
 	m_learn_traj.clear();
 	m_learn_key_clock = 0;
 	m_learn_mask = m_learn_keyed = 0;
+	for (s8 &c : m_learn_chan)
+		c = -1;
 	// レジスタは鍵を押した所でまとめて書かれるので、短くてよい。
 	// 長くすると、その間の音が全部 firmware に回ってしまう。
 	// ただし短すぎると 0x01（鳴らしてから上がっていく）が落ち着く前に切れる
@@ -1410,6 +1412,7 @@ void mu2000::native_learn_finish()
 			cal.cal_res  = m_ndrv.part_res(m_learn_part);
 			cal.cal_ctx  = m_ndrv.part_ctx(m_learn_part);
 			cal.have = true;
+			m_learn_chan[ch] = s8(cals.size());
 			cals.push_back(cal);
 		}
 		const int ndcal = int(cals.size());
@@ -1515,6 +1518,7 @@ void mu2000::native_learn_finish()
 		cal.cal_res  = m_ndrv.part_res(m_learn_part);
 		cal.cal_ctx  = m_ndrv.part_ctx(m_learn_part);
 		cal.have = true;
+		m_learn_chan[ch] = s8(cals.size());
 		cals.push_back(cal);
 	}
 	const int ncal = int(cals.size());
@@ -1530,7 +1534,8 @@ void mu2000::native_learn_finish()
 			                     " / 式 0x11=%04x 要素b18=%d b0=%d b1=%d\n",
 			             k, c.reg[0x11], c.reg[0x32], c.reg[0x09], c.wave_addr(),
 			             w2 ? xg::nv::pitch_reg(xg::nv::read_wave(w2), m_learn_note,
-			                                    xg::nv::key_follow(e2)) : 0,
+			                                    xg::nv::key_follow(e2), 0,
+			                                    xg::nv::key_pivot(e2)) : 0,
 			             e2[18], e2[0], e2[1]);
 			if (w2)
 				std::fprintf(stderr, "        こちらの波形=%08x 基準鍵=%d 微調=%d 上限鍵=%d 追従=%d 組=%d%s",
@@ -1707,9 +1712,8 @@ void mu2000::traj_start(u32 rec, u64 drum_key, int ncal, u32 ctx)
 	t.ctx = ctx;
 	t.drum_key = drum_key;
 	// 写し取ったチャンネルの順が、そのまま写し取りの並び
-	int n = 0;
 	for (int ch = 0; ch < 64; ch++)
-		t.chan[ch] = (m_learn_keyed & (u64(1) << ch)) ? s8(n++) : s8(-1);
+		t.chan[ch] = m_learn_chan[ch];
 	// 鍵を押した瞬間からの控えを、まず入れる
 	for (const auto &e : m_learn_traj)
 		if (e.first < 64 && t.chan[e.first] >= 0 &&

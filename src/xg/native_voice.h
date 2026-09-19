@@ -112,6 +112,11 @@ inline int key_follow(const u8 *elem)
 	return F[elem[19] & 3];
 }
 
+// **鍵の追従の支点**（byte20）。ほとんどの要素は 60（中央のド）だが、
+// Bottle の 75 や Applause の 57 のように別の鍵を支点にするものがある。
+// 支点が 60 でないと、追従が 100 でない音色では鍵 60 でも値がずれる（6.96）
+inline int key_pivot(const u8 *elem) { return elem[20]; }
+
 // 要素を**遅らせて鳴らす**段（byte72）。実測（段 0,1,2,3 → 0,311,752,1634 サンプル）は
 // 441 * 2^(n-1) - 130 でぴったり。MusicBox は 2 つ目の要素を 37ms 遅らせている
 inline u32 elem_delay(const u8 *elem)
@@ -153,14 +158,17 @@ inline int porta_step(const u8 *rom, int cc5)
 	return cc5 < 24 ? raw * 512 : raw * 2;
 }
 
-inline u16 pitch_reg(const wave_info &w, int note, int follow = 100, int cents_extra = 0)
+inline u16 pitch_reg(const wave_info &w, int note, int follow = 100,
+                     int cents_extra = 0, int pivot = 60)
 {
 	// 整数で計算する（firmware と同じ丸めになる。0 の側へ切り捨て）。
-	// **鍵の追従は鍵 60 を支点にする**（波形の基準鍵ではない）。追従が 100 の
-	// ときは同じ式になるが、50 や 20 の音色では基準鍵とのずれぶん食い違う
-	// （Woodblock で 749 セント、TaikoDrum で 1700 セント。どちらも
-	//  50 * (60 - 基準鍵) でぴったり）
-	const int cents = (note - 60) * follow + (60 - w.base_key) * 100
+	// **鍵の追従は要素の支点（byte20）を軸にする**（波形の基準鍵ではない）。
+	// 追従が 100 のときは同じ式になるが、50 や 20 の音色では基準鍵との
+	// ずれぶん食い違う（Woodblock で 749 セント、TaikoDrum で 1700 セント。
+	// どちらも 50 * (60 - 基準鍵) でぴったり）。
+	// 支点はほとんどの要素で 60 なので長らく定数で足りていたが、Bottle（75）
+	// と Applause（57）だけ違っていて、鍵 60 でも値がずれていた（6.96）
+	const int cents = (note - pivot) * follow + (pivot - w.base_key) * 100
 	                + w.fine_cents + cents_extra;
 	const int v = cents * 1024 / 1200;
 	// ビット 14 は波形の**形式**で決まる（形式 3 のときだけ立つ。402 組で確かめた）
@@ -208,13 +216,22 @@ inline int cc_vol_att(const u8 *rom, int cc)
 }
 
 // パン（CC10）の減衰。中央で左右とも -3dB になる cos 則。
-// 右側は pan_att(128 - cc10)。128 点すべて実測と 0.1875dB 以内で合う
-inline int pan_att(int x)
+// 右側は pan_att(128 - cc10)。
+//
+// **ROM に表がある**（`0x1BBAD0` の 128 バイト。6.100）。cos の式で出すと
+// 14 点で 1 ずれていた（丸め方の違い）。この表だと CC 0-127 の左右 128 点が
+// 1 つ残らず実機と合う。`0x1E6B88` にも同じ曲線の**切り捨て**版があって、
+// 送りの表（6.99）と同じ組になっている
+constexpr u32 PAN_ATT_TAB = 0x1BBAD0;
+
+inline int pan_att(const u8 *rom, int x)
 {
 	if (x <= 0)
 		return 0;
 	if (x >= 127)
 		return 255;
+	if (rom)
+		return int(rom[PAN_ATT_TAB + u32(x)]);
 	const double c = std::cos(double(x) / 127.0 * 1.5707963267948966);
 	const int v = int(std::lround(-20.0 * std::log10(c) / 0.375));
 	return v < 0 ? 0 : (v > 255 ? 255 : v);
@@ -230,13 +247,20 @@ inline int bright_shift(int cc) { return 16 * (cc - 64); }
 inline int reso_shift(int cc) { return (cc - 64) / 2; }
 
 // 送り（CC91 リバーブ・CC93 コーラス）→ レジスタ 0x33・0x34 の下位（減衰）。
-// 実測は **16 + level→減衰の表** で、音色によらない（GrandPno・Strings・Flute で同じ）。
-// 使うのは差ぶんだけなので、下駄の 16 は要らない
+// 実測は **16 + 送りの表** で、音色によらない（GrandPno・Strings・Flute で同じ）。
+// 使うのは差ぶんだけなので、下駄の 16 は要らない。
+//
+// **表は `LEVEL_TAB` ではない**（6.99）。音量の表（0x1E6798）は同じ曲線を
+// 切り捨てで持っていて、送りの表（0x1B99B9）は四捨五入で持っている。
+// 1 きざみずつ違うので、CC91 を振ると 1 ずれた値を書いていた。
+// 実測 49 点（CC 1-127）が 0x1B99B9 と 1 つ残らず合う
+constexpr u32 SEND_TAB = 0x1B99B9;      // 0-127 → 送りの減衰（127 バイト。番号 0 が CC1）
+
 inline int send_att(const u8 *rom, int cc)
 {
 	if (cc <= 0)
 		return 255;
-	return int(rom[LEVEL_TAB + u32(std::min(127, cc) - 1)]);
+	return int(rom[SEND_TAB + u32(std::min(127, cc) - 1)]);
 }
 
 // モジュレーション（CC1）→ レジスタ 0x0a の下位（LFO の深さ）に足す。
@@ -455,12 +479,14 @@ inline bool peg_on()
 	return on;
 }
 
-// `0x10` に書く値（セントを渡す）
-inline u16 peg_reg(const u8 *rom, int cents)
+// `0x10` に書く値（セントを渡す）。**ビット 14 は byte10 で決まる**
+// （実機の `0x12AD2E`。byte10 が 0 の音色は立てない。PanFlute・BirdTweet）
+inline u16 peg_reg(const u8 *rom, int cents, const u8 *elem = nullptr)
 {
+	const u16 flag = (!elem || elem[10]) ? 0x4000 : 0;
 	if (!peg_on())
-		return 0x4000;
-	return u16(0x4000 | (u16(cents_to_pitch(rom, cents)) & 0x3fff));
+		return flag;
+	return u16(flag | (u16(cents_to_pitch(rom, cents)) & 0x3fff));
 }
 
 // ---- **フィルタの包絡線**（doc/native-engine.md の 6.63）
@@ -815,12 +841,14 @@ inline u16 cutoff_of(const u8 *rom, const u8 *elem, int note, int vel, int facc)
 	        + cutoff_key_curve(rom, elem, note);
 	cut = cut < 0 ? 0 : (cut > 0xfff ? 0xfff : cut);
 	cut += facc >> 2;
-	// 実機（0x127E08）は足したあとも 0xFFF で頭打ちにして、下 11bit を取る。
-	// そのうえで `0x12E79C` が「**共振が 4 未満なら 0x7C0 で頭打ち**」を掛ける
-	// （EPiano1 は強さ 100 で共振 0 → 0x7C0、強さ 127 で共振 4 → 0x7FF）
+	// **0x800 は下駄**。実機（`0x127E84`）は「0x800 以下なら 1」＝閉じ切りに
+	// してから 0xFFF で頭打ちにし、下 11bit を取る。SynBrass1 は表 0x6d4 に
+	// 鍵の追従 +96、包絡線 -224 で 0x654 ＝ 下駄より下なので、実機は 1 を書く
+	if (cut <= 0x800) cut = 1;
 	if (cut > 0xfff) cut = 0xfff;
 	cut &= 0x7ff;
-	if (cut < 0) cut = 0;
+	// そのうえで `0x12E79C` が「**共振が 4 未満なら 0x7C0 で頭打ち**」を掛ける
+	// （EPiano1 は強さ 100 で共振 0 → 0x7C0、強さ 127 で共振 4 → 0x7FF）
 	if (reso_level(elem, vel) < 4 && cut > CUTOFF_MAX)
 		cut = CUTOFF_MAX;
 	return u16(0x1000 | u16(cut));
@@ -884,6 +912,100 @@ inline u16 voice_pan_reg(const u8 *rom, const u8 *elem, int note,
 	return u16((l << 8) | r);
 }
 
+// ---- **ドラムの 1 打**（doc/native-engine.md の 6.86・6.87）
+//
+// ドラムの記録は 42 バイトで、旋律の要素（84 バイト）とは別の並び。
+// 波形の記録（16 バイト）が +26 にそのまま埋まっている。
+//   +1  音程の微調（セント。64 が中央）   +10 減衰 2 の行き先
+//   +11 切る高さ（表の索引）              +12 共振（>> 2）
+//   +13 立ち上がりの速さ                  +14 減衰 1 の速さ
+//   +15 減衰 2 の速さ                      +20 フィルタの第 2 係数
+//   +26 音程の基準（半音。引く）           +27/+28 GM/XG の半音のずらし
+//   +30..+41 ループ前・ループ長・形式と番地
+constexpr u32 DRUM_PITCH_TAB = 0x1E9298;   // セント → 音程の目盛り（1200 = 1024）
+constexpr u32 DRUM_KIT_TABLE = 0x292250;   // キット → 鍵ごとのずれの表（4 バイト）
+constexpr u32 DRUM_RECORDS   = 0x283dd0;   // ずれの元になる番地
+constexpr u32 PART_KIT       = 0x110;      // パートの塊の中の、キットの番号
+
+// キットの番号と鍵から、ドラムの 1 打の記録（42 バイト）。無ければ nullptr。
+// 実機の `0x134DB8`
+inline const u8 *drum_record(const u8 *rom, int kit, int note)
+{
+	if (!rom || (kit & 0x80))
+		return nullptr;                 // bit7 が立つキットは別の道（未対応）
+	const u32 base = rd32(rom, DRUM_KIT_TABLE + u32(kit & 0x7f) * 4);
+	if (base < 0x200000 || base > 0x2ffff0)
+		return nullptr;
+	const u16 off = rd16(rom, base + u32(note & 0x7f) * 2);
+	return off == 0xffff ? nullptr : rom + DRUM_RECORDS + off;
+}
+
+// `SMU2000_DRUM_EXACT=1` で、ドラムを写し取りではなく式で組む
+inline bool drum_exact()
+{
+	static const bool on = std::getenv("SMU2000_DRUM_EXACT") != nullptr;
+	return on;
+}
+
+inline int drum_cents(const u8 *rec, int coarse = 64, int fine = 64, bool xg = true)
+{
+	const int semi = coarse + (xg ? s8(rec[28]) : int(rec[27])) - int(rec[26]);
+	return semi * 100 + (int(rec[1]) - 64) + (fine - 64);
+}
+
+inline u16 drum_pitch_reg(const u8 *rom, const u8 *rec, int cents)
+{
+	int c = cents < 0 ? -cents : cents;
+	if (c > 9600)
+		c = 9600;
+	const u16 t = rd16(rom, DRUM_PITCH_TAB + u32(c) * 2);
+	u16 v = cents < 0 ? u16((-int(t)) & 0x3fff) : u16(t & 0x3fff);
+	const u32 addr = u32(rec[38]) << 24 | u32(rec[39]) << 16 | u32(rec[40]) << 8 | rec[41];
+	if (((addr >> 30) & 3) == 3)
+		v = u16(v | 0x4000);
+	return v;
+}
+
+// ドラムの 1 打のレジスタを、記録だけから組む（写し取りを使わない）。
+// 4 打 × 全鍵 58 個で実機と一致したものだけを入れてある
+inline slot_regs drum_note(const u8 *rom, const u8 *rec, int att,
+                           const defaults &d = defaults(),
+                           int coarse = 64, int fine = 64)
+{
+	slot_regs r;
+	if (!rom || !rec)
+		return r;
+	r.set(0x00, u16(0x1000 | (rd16(rom, CUTOFF_TAB + u32(rec[11]) * 2) & 0x7ff)));
+	r.set(0x01, 0xffff);
+	r.set(0x02, u16(0x8000 | u16(std::min(0x7ff, int(rec[20]) * 16))));
+	r.set(0x03, d.post);
+	r.set(0x04, u16((rec[12] >> 2) << 11));
+	r.set(0x05, d.lfo_amp);
+	// **速さの表は 2 倍しない**（旋律は rate_scale で 2 倍する）
+	r.set(0x06, u16(u16(rom[ATTACK_TAB + u32(rec[13] & 0x7f)]) << 8
+	                | (rec[13] >= 0x7f ? 0x00 : 0x7e)));
+	r.set(0x07, u16(u16(rom[DECAY_TAB + u32(rec[14] & 0x7f)]) << 8 | 0x04));
+	r.set(0x08, u16(u16(rom[DECAY_TAB + u32(rec[15] & 0x7f)]) << 8
+	                | u16(((0x7f - int(rec[10])) * 2) & 0xff)));
+	r.set(0x09, u16(att & 0xff));
+	r.set(0x0a, 0x7000);
+	r.set(0x0b, 0x0000);
+	r.set(0x10, 0x0000);
+	r.set(0x11, drum_pitch_reg(rom, rec, drum_cents(rec, coarse, fine)));
+	const wave_info w = read_wave(rec + 26);
+	r.set(0x12, u16(w.pre_loop >> 16));
+	r.set(0x13, u16(w.pre_loop));
+	r.set(0x14, u16(w.loop_len >> 16));
+	r.set(0x15, u16(w.loop_len));
+	r.set(0x16, u16(w.format_addr >> 16));
+	r.set(0x17, u16(w.format_addr));
+	for (int i = 0; i < 6; i++)
+		r.set(0x20 + i * 2, d.iir[i]);
+	for (int i = 0; i < 6; i++)
+		r.set(0x32 + i, d.mix[i]);
+	return r;
+}
+
 // 1 音ぶんのレジスタを作る。att は 0x09 に入れる減衰（0-255。小さいほど大きい音）
 inline slot_regs build_note(const u8 *rom, const u8 *elem, int note, int att,
                             const voice_cal *cal = nullptr,
@@ -931,13 +1053,22 @@ inline slot_regs build_note(const u8 *rom, const u8 *elem, int note, int att,
 	// LFO の型と刻み。上位は byte11 に**byte9 が 0 でなければ** 0x40 を足したもの
 	// （Rain は byte9=0 で `2d`）。下位は**音程の深さ = byte14 × 3**
 	// （PanFlute の byte14=1 で 3、ChiffLead・TnklBell・Helicopter の 2 で 6）
-	// 深さは `0x05` と同じく、**遅れ（byte12）と byte13 がどちらも 0 のとき**だけ
+	// 深さは `0x05` と同じく、**遅れ（byte12）と byte13 がどちらも 0 のとき**だけ。
+	//
+	// そのうえで **byte9 が 2 だと音程の深さは 0** になる（6.95）。音色の記録
+	// 全部（962 件）で byte12・byte13 が 0 かつ byte14 が 0 でない要素は
+	// BirdTweet（byte9=2・byte14=6）と Choral（byte9=2・byte14=1）の 2 つだけ
+	// で、実機はどちらも 0 を書く。byte10=0 の組（JumpBrss・StdiumOr）は
+	// ちゃんと深さを書くので、効いているのは byte10 ではなく byte9 のほう。
+	// **音量側（0x05）は 0 にならない**（Choral の byte16=13 → 26 が一致）
+	const int plfo = (elem[12] || elem[13] || elem[9] >= 2)
+	                 ? 0 : ((elem[14] * 3) & 0x7f);
 	r.set(0x0a, u16(((((elem[9] ? 0x40 : 0) | (elem[11] & 0x3f)) << 8))
-	                | u16((elem[12] || elem[13]) ? 0 : ((elem[14] * 3) & 0x7f))));
+	                | u16(plfo)));
 	// 音程の包絡線。速さが 127（即到達）のときだけ初めの高さは byte31 を使う
 	const int prate = peg_rate_reg(rom, elem, note, vel);
 	r.set(0x0b, u16(prate << 8));
-	r.set(0x10, peg_reg(rom, peg_cents(elem, prate == 127 ? elem[31] : elem[30], vel)));
+	r.set(0x10, peg_reg(rom, peg_cents(elem, prate == 127 ? elem[31] : elem[30], vel), elem));
 
 	// --- 包絡線（doc/native-engine.md の 6.3・6.4）
 	//
@@ -963,9 +1094,18 @@ inline slot_regs build_note(const u8 *rom, const u8 *elem, int note, int att,
 	// 要素の byte17 は**半音単位の粗調**、byte18 は**セント単位の離調**（どちらも 64 が中央）。
 	// 離調は重ねの音色で 2 つの層をずらすのに使う。入れないと層がぴったり重なって
 	// 打ち消し合わず、3dB ほど大きくなる（doc/native-engine.md の 6.18）
-	r.set(0x11, pitch_reg(w, note, key_follow(elem), cents_extra + elem_tune(elem)));
-	r.set(0x12, u16(w.pre_loop >> 16));
-	r.set(0x13, u16(w.pre_loop));
+	r.set(0x11, pitch_reg(w, note, key_follow(elem), cents_extra + elem_tune(elem),
+	                      key_pivot(elem)));
+	// **鳴らし始める位置をずらす**（実機の `0x12A9C8`）。要素の byte79 が
+	// 128 サンプル単位、byte80 が 1 サンプル単位の下駄で、ループ前の長さから
+	// 引く。Oboe(7→896)・Clarinet(2→256)・Bagpipe(8→1024) で実機と一致した。
+	// 入れていなかったので、その 3 音色は波形がまるで合っていなかった
+	{
+		const u32 skip = u32(elem[79]) * 128 + elem[80];
+		const u32 pre = w.pre_loop > skip ? w.pre_loop - skip : 0;
+		r.set(0x12, u16(pre >> 16));
+		r.set(0x13, u16(pre));
+	}
 	r.set(0x14, u16(w.loop_len >> 16));
 	r.set(0x15, u16(w.loop_len));
 	r.set(0x16, u16(w.format_addr >> 16));
