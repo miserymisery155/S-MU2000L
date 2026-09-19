@@ -1273,6 +1273,7 @@ void mu2000::set_native_engine(int mode)
 	m_ne_clock = 0;
 	for (u64 &t : m_rx_at)
 		t = 0;
+	m_rx_at_usb = 0;
 	std::memset(m_nown, 0, sizeof(m_nown));
 	for (nmidi &n : m_nmidi)
 		n = nmidi();
@@ -2385,6 +2386,12 @@ void mu2000::run_sample(s32 &left, s32 &right)
 			m_fw_hold = std::max(m_fw_hold, KEEPALIVE_RUN);
 			if (!m_fw_why)
 				m_fw_why = 5;
+			// **つまみを 100ms ごとに必ず拾い直す**（6.125）。下の
+			// 「hold が 0 になったら」だけでは、firmware が音を鳴らしている
+			// 間（m_fw_note_total）や写し取りの録画中は hold が 0 に
+			// ならないので、**一度も拾えない**ことがあった。RPN でベンド幅を
+			// 広げても native は既定の 2 半音のまま鳴らしていた
+			m_ndrv.sync_cc();
 		}
 		// **パネルを触っている間は全速**（6.119）。ボタン・ダイヤル・液晶は
 		// ぜんぶ firmware の仕事なので、細く回したままだと手触りが 20 分の 1 に

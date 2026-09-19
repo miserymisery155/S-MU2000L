@@ -24,6 +24,7 @@ ROM の置き場は --roms、環境変数 SMU2000_ROMS、roms/、../MU2000/roms 
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -258,12 +259,13 @@ def step_threading(rep, roms, first):
 # 混み具合で遅れる。doc/native-engine.md の 6.90）
 SHAPE_MIN = {
     "piano":   0.98, "chord":  0.95, "drums": 0.90, "effects": 0.98,
-    "dense":   0.50, "port_b": 0.98, "bend":  0.98, "lofi":    0.98,
+    "dense":   0.55, "port_b": 0.98, "bend":  0.98, "lofi":    0.98,
     "egcc":    0.98, "porta":  0.95, "at":    0.95, "sxparam": 0.95,
-    "pedals":  0.95, "partsx": 0.95,
+    "pedals":  0.95, "partsx": 0.95, "rpn": 0.95, "mono": 0.95,
     # keylevel は鍵と強さで音量が大きく動く音色ばかりなので、鍵を押す時刻の
-    # ばらつき（6.90）が相関に出やすい。**音量のほうは `native の口` が見る**
-    "keylevel": 0.50,
+    # ばらつき（6.90）が相関に出やすい。**音量のほうは `native の口` が見る**。
+    # 音 1 つずつは tools/native/notelevel.py で見られる
+    "keylevel": 0.95,
 }
 
 
@@ -387,27 +389,37 @@ def step_sampling(rep, roms):
     rep.add("sampling", rc == 0, note)
 
 
-def step_usb(rep, roms, cases):
-    """**USB の口でも native が firmware と同じ時刻で鳴るか**
-    （doc/native-engine.md の 6.120）。プラグインは USB が既定なのに、
-    native の口は MIDI のバイトを DIN の速さ（31250 baud ＝ 14.1 サンプル）で
-    並べていて、実機（19500 byte/s ＝ 2.26 サンプル）より 1 音あたり
-    37 サンプル遅れていた。試験はふだん DIN で鳴らすので気づけなかった"""
+def step_warm(rep, roms, cases):
+    """**2 回目以降の音**（写し取りが済んだ状態）。
+    `dense` の相関が 57% で止まっているのは、60 声のうち半分が
+    **写し取りの音（実機が鳴らす音）**で、firmware の混み具合が
+    firmware の道と違うため（doc/native-engine.md の 6.117・6.121）。
+    写し取りが済めばその音も native が鳴らすので、実際に使うときの値は
+    こちらになる。1 回鳴らして写しを貯め、2 回目を比べる"""
     import math
-    name = "chord"
+    name = "dense"
     if name not in cases:
-        rep.add("USB の口", True, "この回では見ない")
+        rep.add("2 回目", True, "この回では見ない")
         return
     midi, seconds = cases[name]
-    env = {"SMU2000_NO_VOICECACHE": "1"}
-    a, _ = render(roms, "usb_fw", midi, seconds, extra=["--usb"], env=env)
-    b, _ = render(roms, "usb_ne", midi, seconds,
-                  extra=["--usb", "--native-engine"], env=env)
-    if a is None or b is None:
-        rep.add("USB の口", False, "鳴らせなかった")
+    home = WORK / "warmhome"
+    shutil.rmtree(home / "S-MU2000" / "voicecal", ignore_errors=True)
+    home.mkdir(parents=True, exist_ok=True)
+    env = {"LOCALAPPDATA": str(home), "XDG_DATA_HOME": str(home),
+           "HOME": str(home)}
+    extra = ["--native-engine", "--voicecache"]
+    if render(roms, "warm1", midi, seconds, extra=extra, env=env)[0] is None:
+        rep.add("2 回目", False, "1 回目が鳴らせなかった")
         return
-    fa, ra, ca, _ = fpmod.load_wav(str(WORK / "usb_fw.wav"))
-    fb, rb, cb, _ = fpmod.load_wav(str(WORK / "usb_ne.wav"))
+    if render(roms, "warm2", midi, seconds, extra=extra, env=env)[0] is None:
+        rep.add("2 回目", False, "2 回目が鳴らせなかった")
+        return
+    base = WORK / ("%s.wav" % name)
+    if not base.exists():
+        rep.add("2 回目", True, "比べる相手が無い")
+        return
+    fa, ra, ca, _ = fpmod.load_wav(str(base))
+    fb, _, cb, _ = fpmod.load_wav(str(WORK / "warm2.wav"))
     n = min(len(fa) // ca, len(fb) // cb)
     skip = int(round(BOOT_AT * ra))
     cs = []
@@ -421,11 +433,58 @@ def step_usb(rep, roms, cases):
         num = sum(float(x) * float(y) for x, y in zip(sa, sb))
         cs.append(num / math.sqrt(na * nb))
     if not cs:
-        rep.add("USB の口", False, "音が無い")
+        rep.add("2 回目", False, "音が無い")
         return
     med = sorted(cs)[len(cs) // 2]
-    ok = med >= 0.95
-    rep.add("USB の口", ok, "%s の波形の相関 %.0f%%" % (name, 100 * med))
+    ok = med >= 0.70
+    rep.add("2 回目", ok, "%s の波形の相関 %.0f%%（1 回目は 57%%）" % (name, 100 * med))
+
+
+def step_usb(rep, roms, cases):
+    """**USB の口でも native が firmware と同じ時刻で鳴るか**
+    （doc/native-engine.md の 6.120）。プラグインは USB が既定なのに、
+    native の口は MIDI のバイトを DIN の速さ（31250 baud ＝ 14.1 サンプル）で
+    並べていて、実機（19500 byte/s ＝ 2.26 サンプル）より 1 音あたり
+    37 サンプル遅れていた。試験はふだん DIN で鳴らすので気づけなかった"""
+    import math
+    env = {"SMU2000_NO_VOICECACHE": "1"}
+    notes, bad = [], []
+    # chord … USB のバイトの速さ、ports … 4 つの口（C と D は USB だけ）
+    for name in ("chord", "ports"):
+        if name not in cases:
+            continue
+        midi, seconds = cases[name]
+        a, _ = render(roms, "usb_fw", midi, seconds, extra=["--usb"], env=env)
+        b, _ = render(roms, "usb_ne", midi, seconds,
+                      extra=["--usb", "--native-engine"], env=env)
+        if a is None or b is None:
+            bad.append("%s: 鳴らせなかった" % name)
+            continue
+        fa, ra, ca, _ = fpmod.load_wav(str(WORK / "usb_fw.wav"))
+        fb, rb, cb, _ = fpmod.load_wav(str(WORK / "usb_ne.wav"))
+        n = min(len(fa) // ca, len(fb) // cb)
+        skip = int(round(BOOT_AT * ra))
+        cs = []
+        for s0 in range(skip, n - ra, ra):
+            sa = fa[s0 * ca:(s0 + ra) * ca:ca]
+            sb = fb[s0 * cb:(s0 + ra) * cb:cb]
+            na = sum(float(x) * x for x in sa)
+            nb = sum(float(x) * x for x in sb)
+            if na < 1e4 or nb < 1e4:
+                continue
+            num = sum(float(x) * float(y) for x, y in zip(sa, sb))
+            cs.append(num / math.sqrt(na * nb))
+        if not cs:
+            bad.append("%s: 音が無い" % name)
+            continue
+        med = sorted(cs)[len(cs) // 2]
+        notes.append("%s %.0f%%" % (name, 100 * med))
+        # ports は USB のとき、実機の側が**口ごとに違う遅れ**で鳴らす
+        # （口 A +43 に対し B +117・C +151・D +104 サンプル。まだ真似できて
+        # いない。doc/native-engine.md の 6.126）。DIN では 100% 出る
+        if med < (0.80 if name == "ports" else 0.95):
+            bad.append("%s %.0f%%" % (name, 100 * med))
+    rep.add("USB の口", not bad, "、".join(bad or notes) + ("（下限を割った）" if bad else ""))
 
 
 # パネルの試験で押すボタン（品書きを一巡りする）
@@ -541,6 +600,10 @@ def main():
         print()
         print("== 9. USB の口（プラグインの既定）")
         step_usb(rep, roms, cases)
+
+        print()
+        print("== 10. 2 回目の音（写し取りが済んだ状態）")
+        step_warm(rep, roms, cases)
 
     rep.show()
     return 1 if rep.bad else 0

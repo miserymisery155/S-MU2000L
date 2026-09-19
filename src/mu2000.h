@@ -431,6 +431,7 @@ private:
 		return v;
 	}
 	u64  m_rx_at[MIDI_PORTS] = {};                   // その口が次のバイトを受け終える時刻
+	u64  m_rx_at_usb = 0;                            // USB の線（4 口で分け合う）
 	// kind 0=離し 1=押し 2=CC 3=ベンド 4=音色の指定 5=XG のパートの設定（08 pp d0=d1）
 	struct nev { u64 at; u8 kind, part, d0, d1; };
 	std::deque<nev> m_nq;
@@ -497,10 +498,16 @@ private:
 	u64 rx_advance(int port)
 	{
 		const u64 now = m_ne_clock * 64;
-		if (m_rx_at[port] < now)
-			m_rx_at[port] = now;
-		m_rx_at[port] += rx_usb(port) ? rx_byte_tick_usb() : rx_byte_tick();
-		return (m_rx_at[port] + native_proc64()) / 64;
+		// **USB は 4 つの口が 1 本の線を分け合う**（doc/native-engine.md の 6.126）。
+		// DIN は口ごとに別の線なので別々に数えるが、USB では口 A のバイトが
+		// 口 C のバイトを待たせる。口ごとに数えていたので、口 B・C・D の音が
+		// 実機より 80-94 サンプル早く出ていた
+		const bool usb = rx_usb(port);
+		u64 &at = usb ? m_rx_at_usb : m_rx_at[port];
+		if (at < now)
+			at = now;
+		at += usb ? rx_byte_tick_usb() : rx_byte_tick();
+		return (at + native_proc64()) / 64;
 	}
 	bool nown(int part, int note) const
 	{ return (m_nown[part][(note >> 5) & 3] & (u32(1) << (note & 31))) != 0; }

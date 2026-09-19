@@ -404,6 +404,186 @@ def case_keylevel():
     return [track(seq(ev))], t + 1.5
 
 
+def rpn(num_msb, num_lsb, data_msb, data_lsb=None):
+    """RPN を 1 つ。番号を選んで値を入れ、最後に 0x7F 0x7F で閉じる"""
+    ev = [b'\xb0\x65' + bytes([num_msb]), b'\xb0\x64' + bytes([num_lsb]),
+          b'\xb0\x06' + bytes([data_msb])]
+    if data_lsb is not None:
+        ev.append(b'\xb0\x26' + bytes([data_lsb]))
+    ev += [b'\xb0\x65\x7f', b'\xb0\x64\x7f']
+    return ev
+
+
+def nrpn(num_msb, num_lsb, data_msb):
+    """NRPN を 1 つ。XG は閉じない（実機の曲もそうしている）"""
+    return [b'\xb0\x63' + bytes([num_msb]), b'\xb0\x62' + bytes([num_lsb]),
+            b'\xb0\x06' + bytes([data_msb])]
+
+
+def spread(t, msgs, gap=0.01):
+    """並びに時刻を振る（MIDI の線を詰まらせないよう少し空ける）"""
+    return [(t + i * gap, m) for i, m in enumerate(msgs)]
+
+
+def case_rpn():
+    """**RPN と NRPN**。native の口はこの CC をさばかず firmware に回すので、
+    firmware の RAM から拾い直せているかを見る（xg/native_driver.h の sync_cc）。
+
+    * RPN 0 … ベンド幅。2 半音の既定から 12 半音に広げてベンドする
+    * RPN 1 … 微調（ピッチベンドセンシティビティではなく音程そのもの）
+    * RPN 2 … 粗調（半音単位）
+    * NRPN 01 08/09/0A … ビブラートの速さ・深さ・遅れ
+    * NRPN 01 20/21 … フィルタの切る高さ・共振
+    * NRPN 01 63/64/66 … EG の立ち上がり・減衰・離し
+
+    ここが壊れると、ベンド幅を広げた曲の音程や、NRPN で音を作る曲が狂う"""
+    ev = head()
+    ev += [(1.0, b'\xc0\x50')]                       # Square Lead
+    ev += note(0, 60, 100, 1.2, 0.8)                  # 1 音目。ここで写し取る
+    # RPN 0: ベンド幅を 12 半音に
+    ev += spread(2.0, rpn(0, 0, 12))
+    ev += note(0, 60, 100, 2.2, 1.0)
+    ev += [(2.5, b'\xe0\x00\x60'), (2.8, b'\xe0\x00\x20'),
+           (3.1, b'\xe0\x00\x40')]                  # 上げて下げて戻す
+    # RPN 1: 微調（+50 セントくらい）
+    ev += spread(3.4, rpn(0, 1, 0x48))
+    ev += note(0, 60, 100, 3.6, 0.8)
+    ev += spread(4.5, rpn(0, 1, 0x40))                # 戻す
+    # RPN 2: 粗調（-3 半音）
+    ev += spread(4.7, rpn(0, 2, 61))
+    ev += note(0, 60, 100, 4.9, 0.8)
+    ev += spread(5.8, rpn(0, 2, 64))                  # 戻す
+    # NRPN: ビブラート
+    ev += spread(6.0, nrpn(1, 0x08, 0x50) + nrpn(1, 0x09, 0x60) + nrpn(1, 0x0a, 0x10))
+    ev += note(0, 60, 100, 6.4, 1.2)
+    # NRPN: フィルタ
+    ev += spread(7.8, nrpn(1, 0x20, 0x20) + nrpn(1, 0x21, 0x50))
+    ev += note(0, 60, 100, 8.2, 0.8)
+    # NRPN: EG
+    ev += spread(9.1, nrpn(1, 0x63, 0x20) + nrpn(1, 0x64, 0x60) + nrpn(1, 0x66, 0x60))
+    ev += note(0, 60, 100, 9.5, 1.0)
+    return [track(seq(ev))], 11.0
+
+
+def case_mono():
+    """**モノ / ポリ**（CC126・CC127）とキーアサイン。
+    モノのパートは後から押した鍵が前の音を止める。native が止め忘れると
+    音が重なって 3dB 大きくなる"""
+    ev = head()
+    ev += [(1.0, b'\xc0\x50')]
+    ev += note(0, 60, 100, 1.2, 0.8)                  # 1 音目。ここで写し取る
+    ev += [(2.1, b'\xb0\x7e\x01')]                  # CC126 モノ
+    # 重ねて押す（モノなら後の音だけ残る）
+    ev += note(0, 60, 100, 2.3, 1.2)
+    ev += note(0, 64, 100, 2.7, 0.8)
+    ev += note(0, 67, 100, 3.1, 0.8)
+    ev += [(4.2, b'\xb0\x7f\x00')]                  # CC127 ポリに戻す
+    ev += note(0, 60, 100, 4.4, 1.2)
+    ev += note(0, 64, 100, 4.8, 0.8)
+    ev += note(0, 67, 100, 5.2, 0.8)
+    return [track(seq(ev))], 7.0
+
+
+def case_ports():
+    """**MIDI IN A-D の 4 口**（パート 1-64）。C と D は USB でしか来ないので、
+    `run_tests.py` は `--usb` で鳴らす（`step_usb`）。
+
+    口ごとの振り分け・パートの番号の付け方・64 パートぶんのスロットの
+    取り合いを一度に見る。ここが壊れると、3 口目から先が無音になるか、
+    別のパートの音で鳴る"""
+    tracks = []
+    progs = (0x00, 0x30, 0x50, 0x0b)
+    keys = (48, 55, 62, 69)
+    for port in range(4):
+        ev = head() if port == 0 else []
+        ev += [(1.0, bytes([0xc0, progs[port]]))]
+        ev += note(0, keys[port], 100, 1.3 + port * 0.12, 1.4)
+        # 2 音目は native が鳴らす
+        ev += note(0, keys[port] + 3, 100, 3.0 + port * 0.12, 1.2)
+        tracks.append(track(seq(ev), port=port))
+    return tracks, 5.5
+
+
+def case_ctlreset():
+    """**CC120 オールサウンドオフ・CC121 コントローラリセット・CC123 オールノートオフ**。
+
+    * CC123 は押している鍵を**離す**（離しの尾は残る）
+    * CC120 は**その場で切る**（尾も残らない）
+    * CC121 はつまみを既定に戻す（音量・パン・ベンドなど）
+
+    ここが壊れると、曲の切り替わりで音が残るか、逆に切れすぎる"""
+    ev = head()
+    ev += [(1.0, b'\xc0\x30')]                      # Strings（尾が長い）
+    ev += note(0, 60, 100, 1.2, 0.8)                 # 1 音目。ここで写し取る
+    # CC123 オールノートオフ（離す）
+    ev += [(2.1, bytes([0x90, 64, 100])), (2.1, bytes([0x90, 67, 100]))]
+    ev += [(2.6, b'\xb0\x7b\x00')]
+    # CC120 オールサウンドオフ（その場で切る）
+    ev += [(3.4, bytes([0x90, 60, 100])), (3.4, bytes([0x90, 64, 100]))]
+    ev += [(3.9, b'\xb0\x78\x00')]
+    # つまみを動かしてから CC121 で戻す
+    ev += [(4.5, b'\xb0\x07\x40'), (4.55, b'\xb0\x0a\x20'),
+           (4.6, b'\xe0\x00\x60')]
+    ev += note(0, 62, 100, 4.8, 0.8)
+    ev += [(5.8, b'\xb0\x79\x00')]                  # CC121 リセット
+    ev += note(0, 62, 100, 6.0, 0.8)                 # 既定に戻っているはず
+    return [track(seq(ev))], 7.5
+
+
+def case_scale():
+    """**スケールチューニング**（XG の 08 pp 41-4C。C から B まで 12 個、
+    64 が 0 セント）と**パートの EQ**（08 pp 6A-6F）。
+
+    スケールチューニングは音名ごとに音程をずらす（純正律などを作るためのもの）。
+    パートの EQ は写し取りの「経路の印」に入っているので、動かしたら
+    取り直しが走るはず。ここが壊れると、和音の中の特定の音だけ音程が違う"""
+    ev = head()
+    ev += [(1.0, b'\xc0\x50')]                       # Square Lead
+    ev += note(0, 60, 100, 1.2, 0.8)                  # 1 音目。ここで写し取る
+    # C を +30 セント、E を -20 セント、G を +50 セント
+    t = 2.1
+    for lo, val in ((0x41, 64 + 30), (0x45, 64 - 20), (0x48, 64 + 50)):
+        ev += [(t, xg([0x08, 0x00, lo, val]))]
+        t += 0.05
+    for i, k in enumerate((60, 64, 67)):
+        ev += note(0, k, 100, t + i * 0.7, 0.6)
+    t += 2.2
+    # 戻す
+    for lo in (0x41, 0x45, 0x48):
+        ev += [(t, xg([0x08, 0x00, lo, 64]))]
+        t += 0.05
+    ev += note(0, 60, 100, t + 0.2, 0.6)              # 最初の写しが効くはず
+    t += 1.0
+    # パートの EQ（低域を上げる・高域を下げる）
+    ev += [(t, xg([0x08, 0x00, 0x72, 64 + 12]))]      # EQ 低域のゲイン
+    ev += [(t + 0.05, xg([0x08, 0x00, 0x73, 64 - 12]))]  # EQ 高域のゲイン
+    ev += note(0, 60, 100, t + 0.3, 0.8)
+    return [track(seq(ev))], t + 2.0
+
+
+def case_kits():
+    """**ドラムキットの切り替え**（バンク MSB 127）と**SFX バンク**（MSB 64）。
+
+    キットごとに 1 打の記録が別の場所にあるので、引き方が壊れると
+    別の音が鳴るか無音になる。SFX バンクは旋律の音色と同じ引き方だが
+    組が違う（doc/native-engine.md の 6.111）"""
+    ev = head()
+    # ドラム（チャンネル 10）でキットを替えながら打つ
+    t = 1.0
+    for kit in (0, 8, 16, 32, 40):
+        ev += [(t, b'\xb9\x00\x7f'), (t + 0.02, b'\xb9\x20\x00'),
+               (t + 0.04, bytes([0xc9, kit]))]
+        for i, k in enumerate((36, 38, 42)):
+            ev += note(9, k, 110, t + 0.2 + i * 0.2, 0.1)
+        t += 1.0
+    # SFX バンク（MSB 64）をチャンネル 1 で
+    ev += [(t, b'\xb0\x00\x40'), (t + 0.02, b'\xb0\x20\x00'),
+           (t + 0.04, b'\xc0\x7c')]                  # Telephone 系
+    ev += note(0, 60, 100, t + 0.3, 0.8)
+    ev += note(0, 67, 100, t + 1.3, 0.8)
+    return [track(seq(ev))], t + 3.0
+
+
 CASES = {
     "piano":   case_piano,
     "chord":   case_chord,
@@ -420,6 +600,12 @@ CASES = {
     "pedals":  case_pedals,
     "partsx":  case_partsx,
     "keylevel": case_keylevel,
+    "rpn":     case_rpn,
+    "mono":    case_mono,
+    "ctlreset": case_ctlreset,
+    "ports":   case_ports,
+    "scale":   case_scale,
+    "kits":    case_kits,
 }
 
 

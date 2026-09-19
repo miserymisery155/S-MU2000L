@@ -64,6 +64,12 @@ constexpr u32 part_base(int part)
 }
 constexpr u32 PART_XG_SIZE = 0x29;  // 08 pp 00-28
 // パートの EQ（08 pp 72-77）は塊の +0x6A から。XG の番地から 8 引いた所
+// **スケールチューニング**（XG の 08 pp 41-4C ＝ C から B まで 12 個。
+// 64 が 0 セント）。ワーク RAM では +0x3A から 12 バイト。
+// 実機が書くところを見て突き止めた（doc/native-engine.md の 6.127）
+constexpr u32 PART_SCALE_XG  = 0x41;
+constexpr u32 PART_SCALE_RAM = 0x3a;
+constexpr u32 PART_SCALE_SIZE = 12;
 constexpr u32 PART_EQ_XG   = 0x72;
 constexpr u32 PART_EQ_RAM  = 0x6a;
 constexpr u32 PART_EQ_SIZE = 6;
@@ -71,6 +77,10 @@ constexpr u32 PART_EQ_SIZE = 6;
 // パートの塊の中の、XG に番地の無い演奏中の値
 constexpr u32 PART_MOD  = 0x7d;     // CC1
 constexpr u32 PART_EXP  = 0x7e;     // CC11
+// **RPN の行き先**（doc/native-engine.md の 6.125）。XG の 08 pp のならびとは
+// 別の場所に入る。実機が書くところを見て突き止めた
+constexpr u32 PART_COARSE = 0xc9;   // RPN 2（粗調）。符号つきの半音（実機の式にある）
+constexpr u32 PART_FINE   = 0xcc;   // RPN 1（微調）。16bit 符号つき、8192 で 100 セント
 constexpr u32 PART_BEND = 0x80;     // ピッチベンドの MSB の半分（0x20 が真ん中）
 constexpr u32 PART_HOLD = 0xd9;     // CC64。0 か 1
 constexpr u32 PART_VOICE = 0xf8;    // 選んでいる音色の記録を指す値（ROM の中。xg/voices.h）
@@ -112,6 +122,11 @@ inline bool locate(u32 addr, u32 &off)
 	}
 	if (hi == 0x08 && mid < 32 && lo < PART_XG_SIZE) {
 		off = part_base(mid) + lo;
+		return true;
+	}
+	if (hi == 0x08 && mid < 32 && lo >= PART_SCALE_XG &&
+	    lo < PART_SCALE_XG + PART_SCALE_SIZE) {
+		off = part_base(mid) + PART_SCALE_RAM + (lo - PART_SCALE_XG);
 		return true;
 	}
 	if (hi == 0x08 && mid < 32 && lo >= PART_EQ_XG && lo < PART_EQ_XG + PART_EQ_SIZE) {

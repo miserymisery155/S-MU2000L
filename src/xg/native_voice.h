@@ -1332,9 +1332,16 @@ inline slot_regs build_note(const u8 *rom, const u8 *elem, int note, int att,
 		static const int COPY[] = { 0x00, 0x01, 0x06, 0x0a,
 		                            0x20, 0x22, 0x24, 0x26, 0x28, 0x2a,
 		                            0x32, 0x33, 0x34, 0x35, 0x36, 0x37 };
-		for (int i : COPY)
+		for (int i : COPY) {
+			// **`0x00` を式で出せるときは写し取りで上書きしない**（6.124）。
+			// 写し取りは鍵 1 つ・強さ 1 つぶんしか無いので、**強さの違う音**の
+			// 切る高さが出せない（写し取りが強さ 100 なら、強さ 127 の音は
+			// 実機より暗いままだった。keylevel の強さ 127 の音が全部そう）
+			if (i == 0x00 && cut_exact())
+				continue;
 			if (cal->has(i))
 				r.set(i, cal->reg[i]);
+		}
 	}
 	return r;
 }
