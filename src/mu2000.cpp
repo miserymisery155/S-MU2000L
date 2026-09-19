@@ -299,10 +299,14 @@ void mu2000::set_button(button b, bool pressed)
 	if (i < 0 || i >= int(button::count))
 		return;
 	const button_slot &s = BUTTONS[i];
+	const bool was = !BIT(m_sws[s.row], s.bit);
 	if (pressed)
 		m_sws[s.row] &= u8(~(1 << s.bit));
 	else
 		m_sws[s.row] |= u8(1 << s.bit);
+	// **押し離しが変わったときだけ**（毎こま同じ値で呼ばれても効かないように）
+	if (was != pressed)
+		panel_touched();
 }
 
 bool mu2000::button_pressed(button b) const
@@ -694,6 +698,15 @@ void mu2000::lcd_port_w(u16 data)
 				m_lcd.data_w(u8(data >> 8));
 			else
 				m_lcd.control_w(u8(data >> 8));
+			// **押したあと画面が動いている間は延ばす**（6.119）。ボタンを
+			// 押したあとの仕事が 0.5 秒で終わらないことがある（品書きの
+			// 読み込みなど）。書き換えが止まれば、すぐ細い回しに戻る。
+			// **触っていないときは延ばさない**。ここを「液晶が動いたら
+			// いつでも」にすると、曲を鳴らしている最中の表示更新でも
+			// firmware が全速になり、写し取りの中身まで変わってしまう
+			// （port_b 100% -> 97%、porta 81% -> 53%）
+			if (m_native_engine && m_panel_hold && m_panel_hold < LCD_RUN)
+				m_panel_hold = LCD_RUN;
 		}
 	}
 	m_pe = data;
@@ -1271,6 +1284,7 @@ void mu2000::set_native_engine(int mode)
 	m_ne_by_learn.store(0, std::memory_order_relaxed);
 	m_ne_by_midi.store(0, std::memory_order_relaxed);
 	m_ne_by_keep.store(0, std::memory_order_relaxed);
+	m_ne_by_panel.store(0, std::memory_order_relaxed);
 	m_fw_why = 0;
 	m_ne_stats = native_stats();
 	if (!mode) {
@@ -1332,6 +1346,10 @@ void mu2000::native_learn_start(u32 rec)
 		// 鍵を押したあとのフィルタ・LFO の動きを、時刻つきで控えておく
 		if (m_learn_key_clock) {
 			const int r2 = int(reg % 64);
+			// **10ms タイマの位相をここで学ぶ**（6.118）。実機が 0x00 を
+			// 書いた時刻そのものが、firmware の 10ms 割り込みの目
+			if (r2 == 0x00 && reg < 0x1000)
+				m_ndrv.set_eg_phase(u32(m_ne_clock));
 			if ((r2 == 0x00 || r2 == 0x01 || r2 == 0x04 || r2 == 0x05 || r2 == 0x0a) &&
 			    reg < 0x1000 && m_learn_traj.size() < 512)
 				m_learn_traj.push_back({ int(reg / 64),
@@ -1472,7 +1490,7 @@ void mu2000::native_learn_finish()
 					continue;
 				const u8 *e2 = xg::nv::element(rom, m_learn_rec, k);
 				const u8 *w2 = xg::nv::wave_entry(rom, xg::nv::wave_set(e2),
-				                                  xg::nv::wave_note(e2, learn_note_shifted()));
+				                                  xg::nv::wave_note(rom, e2, learn_note_shifted()));
 				if (w2 && xg::nv::read_wave(w2).format_addr == want) {
 					idx = k;
 					used_elem |= 1u << k;
@@ -1507,14 +1525,18 @@ void mu2000::native_learn_finish()
 			const int fwl = xg::nv::fw_voice_level(m_ram.data(), ch);
 			// **検算**: 読んだ目盛りから組み直した減衰が、実機が書いた 0x09 と
 			// 合うか。合わなければ塊が別の声のものなので、逆引きに落とす
-			const bool good = fwl > 0 &&
-			    xg::nv::volume_att_from(rom, fwl, rest, gain) == att_ref;
-			cal.base_level = good
-			    ? xg::nv::base_level_from_fw(rom, el0, fwl, learn_note_shifted())
-			    : xg::nv::calibrate_level(rom, el0, att_ref, learn_note_shifted(),
-			                              learn_vel_sensed(), gain);
-			if (!good && fwl > 0)
-				m_ne_lvl_miss++;
+			// **目盛りは ROM から出す**（6.113）。ここで覚えるのは、実機の
+			// ボイスの塊 +118 とのずれだけ（普通は 0）。**頭打ち（0 か 128）に
+			// なっている鍵では差が取れない**ので、そのときは 0 のままにする
+			const int mine = xg::nv::volume_level(rom, m_learn_rec, el0,
+			                                      learn_note_shifted(), 0);
+			cal.base_level = 0;
+			if (fwl >= 1 && fwl <= 127 && mine >= 1 && mine <= 127
+			    && xg::nv::volume_att_from(rom, fwl, rest, gain) == att_ref) {
+				cal.base_level = fwl - mine;
+				if (cal.base_level)
+					m_ne_lvl_miss++;
+			}
 		}
 		// **減衰の目盛りのずれを覚える**。実機が書いた 0x07・0x08 の上位から
 		// 目盛りを引き直し、こちらの式で出した目盛りとの差を取る。
@@ -1562,19 +1584,20 @@ void mu2000::native_learn_finish()
 		for (int k = 0; k < ncal; k++) {
 			const xg::nv::voice_cal &c = cals[size_t(k)];
 			const u8 *e2 = xg::nv::element(rom, m_learn_rec, k);
-			const u8 *w2 = xg::nv::wave_entry(rom, xg::nv::wave_set(e2), xg::nv::wave_note(e2, m_learn_note));
+			const u8 *w2 = xg::nv::wave_entry(rom, xg::nv::wave_set(e2),
+			                                  xg::nv::wave_note(rom, e2, m_learn_note));
 						std::fprintf(stderr, "  写し%d 0x11=%04x 0x32=%04x 0x09=%04x 波形=%08x"
 			                     " / 式 0x11=%04x 要素b18=%d b0=%d b1=%d\n",
 			             k, c.reg[0x11], c.reg[0x32], c.reg[0x09], c.wave_addr(),
 			             w2 ? xg::nv::pitch_reg(xg::nv::read_wave(w2), m_learn_note,
-			                                    xg::nv::key_follow(e2), 0,
+			                                    xg::nv::key_follow(rom, e2), 0,
 			                                    xg::nv::key_pivot(e2)) : 0,
 			             e2[18], e2[0], e2[1]);
 			if (w2)
 				std::fprintf(stderr, "        こちらの波形=%08x 基準鍵=%d 微調=%d 上限鍵=%d 追従=%d 組=%d%s",
 				             xg::nv::read_wave(w2).format_addr, xg::nv::read_wave(w2).base_key,
 				             xg::nv::read_wave(w2).fine_cents, xg::nv::read_wave(w2).key_max,
-				             xg::nv::key_follow(e2), xg::nv::wave_set(e2), "\n");
+				             xg::nv::key_follow(rom, e2), xg::nv::wave_set(e2), "\n");
 		}
 	}
 	const u32 learn_ctx = cals.empty() ? 0 : cals[0].cal_ctx;
@@ -1781,6 +1804,8 @@ void mu2000::traj_watch(u32 reg, u16 value)
 		// LFO は「かけ始めるまでの間」や深さの増やし方を firmware がソフトでやっている
 		if (r != 0x00 && r != 0x01 && r != 0x04 && r != 0x05 && r != 0x0a)
 			continue;
+		if (r == 0x00)
+			m_ndrv.set_eg_phase(u32(m_ne_clock));
 		if (t.n >= 4096 || size_t(t.chan[ch]) >= t.cals->size())
 			continue;
 		// **その場で**写し取りに足す。いま鳴っている native の音も、
@@ -2361,6 +2386,17 @@ void mu2000::run_sample(s32 &left, s32 &right)
 			if (!m_fw_why)
 				m_fw_why = 5;
 		}
+		// **パネルを触っている間は全速**（6.119）。ボタン・ダイヤル・液晶は
+		// ぜんぶ firmware の仕事なので、細く回したままだと手触りが 20 分の 1 に
+		// なる。ダイヤルの目盛りが残っている間も回し続ける（実機は 2.5ms ごとに
+		// 1 目盛りしか読まないので、止めると入力が溜まったままになる）
+		if (m_panel_hold || m_enc_pending) {
+			if (m_panel_hold)
+				m_panel_hold--;
+			m_fw_hold = std::max(m_fw_hold, u32(2));
+			if (!m_fw_why)
+				m_fw_why = 6;
+		}
 		// 「溜まっている間は回す」はやめた。渡した MIDI は 1 バイト 14 サンプルかけて
 		// 線を流れるので、それを待つだけで実時間の 2 割を SH-2 に持っていかれていた。
 		// メッセージごとに置く待ち（下の native_midi）で足りる
@@ -2387,6 +2423,8 @@ void mu2000::run_sample(s32 &left, s32 &right)
 				m_ne_by_midi.fetch_add(1, std::memory_order_relaxed);
 			else if (m_fw_why == 5)
 				m_ne_by_keep.fetch_add(1, std::memory_order_relaxed);
+			else if (m_fw_why == 6)
+				m_ne_by_panel.fetch_add(1, std::memory_order_relaxed);
 			else
 				m_ne_by_other.fetch_add(1, std::memory_order_relaxed);
 		}

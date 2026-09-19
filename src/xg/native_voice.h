@@ -104,12 +104,23 @@ inline wave_info read_wave(const u8 *e)
 
 // 音程のレジスタ（0x11）。1 オクターブ = 1024、細かい調整はセント（**足す**）。
 // 実測（鍵 0-127・18 区画）と ±0.7 目盛りで合う
-// 鍵の追従率（記録の byte19）。0 が普通の 100 セント/半音で、
-// 1 が半分、2 が 1/5、3 が 1/10。効果音の音色でよく使う
-inline int key_follow(const u8 *elem)
+// 鍵の追従率（記録の byte19）。**表は ROM の `0x1E5E58` に 6 個**
+// （`100, 50, 20, 10, 5, 0`。そのすぐ後ろが強さの曲線 `0x1E5E5E`）。
+//
+// 前は 4 個の表を `byte19 & 3` で引いていたので、**byte19 が 4 の要素を
+// 100、5 を 50 と読んでいた**。実機が引く記録を全部当たると byte19 は
+// 0-5 で、4 か 5 の要素が 16 個ある（GM では Goblins・MelodTom・FretNoiz の
+// 第 2 要素。ほかは効果音バンク）。5 は「鍵でまったく動かない」＝ 打楽器や
+// 効果音の音（6.112）
+constexpr u32 KEY_FOLLOW_TAB = 0x1E5E58;
+constexpr int KEY_FOLLOW_N   = 6;
+
+inline int key_follow(const u8 *rom, const u8 *elem)
 {
-	static const int F[4] = { 100, 50, 20, 10 };
-	return F[elem[19] & 3];
+	const int i = int(elem[19]);
+	if (!rom || i < 0 || i >= KEY_FOLLOW_N)
+		return 100;
+	return int(rom[KEY_FOLLOW_TAB + u32(i)]);
 }
 
 // **鍵の追従の支点**（byte20）。ほとんどの要素は 60（中央のド）だが、
@@ -137,10 +148,10 @@ inline u32 elem_delay(const u8 *elem)
 // * Rain（96）は byte17 が +24、**追従 20**、支点 60。鍵 84 なら
 //   60 + 24*20/100 + 24 = 88 で、上限鍵 96 の記録に入る。粗調だけで
 //   数えると 108 になって、1 つ先の記録（上限鍵 108）を取ってしまう（6.110）
-inline int wave_note(const u8 *elem, int note)
+inline int wave_note(const u8 *rom, const u8 *elem, int note)
 {
 	const int piv = key_pivot(elem);
-	const int n = piv + (note - piv) * key_follow(elem) / 100 + int(elem[17]) - 64;
+	const int n = piv + (note - piv) * key_follow(rom, elem) / 100 + int(elem[17]) - 64;
 	return n < 0 ? 0 : (n > 127 ? 127 : n);
 }
 
@@ -378,8 +389,9 @@ inline int vel_sense(int vel, int depth, int offset)
 //   減衰 = 表2[0x1E6798 + 表1[0x1E5E5E + 曲線*128 + 強さ]]
 //
 // **曲線は要素の byte68 で選ぶ**（6.109）。表は 7 行しかない
-// （0x1E5E5E から 0x1E61DE まで ＝ 128 × 7）。byte68 が 7 以上の要素も
-// あるが、そこは別の使われ方をしているようなので行 0 に倒す。
+// （0x1E5E5E から 0x1E61DE まで ＝ 128 × 7。行 7 の位置は別の表で、
+// 値が曲線になっていない）。実機が引く記録 290 件・要素 451 個を当たると
+// byte68 は**すべて 0-6**。念のため範囲外は行 0 に倒す。
 // 行 0 は素通し、行 1 は少し丸い曲線。Bottle(76) と SoundTrk(97) が行 1 で、
 // 実機のボイスの塊 +119 が強さ 40/100/127 で 22/4/0（行 0 なら 26/5/0）
 constexpr int VEL_CURVE_ROWS = 7;
@@ -695,7 +707,7 @@ inline int level_from_att(const u8 *rom, int att)
 // 「素の音量」を出す。これがあれば、ほかの鍵・強さの減衰は式で出せる
 inline int wave_level(const u8 *rom, const u8 *elem, int note)
 {
-	const u8 *we = wave_entry(rom, wave_set(elem), wave_note(elem, note));
+	const u8 *we = wave_entry(rom, wave_set(elem), wave_note(rom, elem, note));
 	return we ? int(we[0]) : 0;
 }
 
@@ -769,10 +781,29 @@ inline int base_level_from_fw(const u8 *rom, const u8 *elem, int fw_level, int n
 	return fw_level - level_curve_scaled(rom, elem, note_ref);
 }
 
-// 掛ける前の音量の目盛り（鍵の曲線まで入れたもの）
-inline int volume_level(const u8 *rom, const u8 *elem, int base_level, int note)
+// **掛ける前の音量の目盛りは ROM から出せる**（6.113）。実機（`0x12ABE0`）は
+//
+//   目盛り = clamp((音色の記録[1] * 要素[59]) / 99 + 鍵の曲線 * 2, 0, 128)
+//
+// （firmware の番号では要素[57]。こちらの要素の番号は実機より 2 大きい）。
+// Bottle 65・PickBass 106・GrandPno 108・Strings1 97・Flute 97 が、実機の
+// ボイスの塊 +118 とそのまま一致する。
+//
+// **写し取りで逆に引くのをやめた理由**: 目盛りは 0-128 で頭打ちになるので、
+// 張り付く鍵（PickBass の鍵 36 など）で写し取ると本当の値が取れない。
+// ROM から出せば、どの鍵で写し取っても同じ答えになる
+inline int voice_raw_level(const u8 *rom, u32 rec, const u8 *elem)
 {
-	int l = base_level + level_curve_scaled(rom, elem, note);
+	if (!rom || !rec)
+		return 64;
+	return int(rom[rec + 1]) * int(elem[59]) / 99;
+}
+
+// 掛ける前の音量の目盛り（鍵の曲線まで入れたもの）。
+// `adj` は写し取りで見つかったずれ（普通は 0）
+inline int volume_level(const u8 *rom, u32 rec, const u8 *elem, int note, int adj = 0)
+{
+	int l = voice_raw_level(rom, rec, elem) + adj + level_curve_scaled(rom, elem, note);
 	if (l < 0) l = 0;
 	return l > 128 ? 128 : l;
 }
@@ -797,10 +828,10 @@ inline int volume_att_from(const u8 *rom, int level, int rest, int gain)
 }
 
 // 校正した素の音量から、その鍵・強さの減衰（0x09 に入れる値）
-inline int volume_att(const u8 *rom, const u8 *elem, int base_level, int note, int vel,
-                      int gain = VOL_GAIN_DEF)
+inline int volume_att(const u8 *rom, u32 rec, const u8 *elem, int note, int vel,
+                      int gain = VOL_GAIN_DEF, int adj = 0)
 {
-	return volume_att_from(rom, volume_level(rom, elem, base_level, note),
+	return volume_att_from(rom, volume_level(rom, rec, elem, note, adj),
 	                       volume_rest(rom, elem, note, vel), gain);
 }
 
@@ -968,11 +999,23 @@ inline int fenv_init(const u8 *rom, const u8 *elem, int vel)
 //   そこへ包絡線の初めの値（>>2）を足して下 11bit を取る
 // 包絡線の今の値（facc）を渡すと、そのときの `0x00` を返す。
 // 実機は 10ms ごとにこれを書き直している
-// `SMU2000_CUT_EXACT=1` で、鍵を押した瞬間の `0x00` を実機と同じ式にする。
-// 既定は切（上の但し書きを見よ）
+// 鍵を押した瞬間の `0x00` を**実機と同じ式で出す**。
+//
+// **2026-09-20 から既定で入**（6.116）。以前は「写し取りの無いスロットは
+// フィルタの包絡線が動かないので試し曲が 0.36dB 明るくなる」ので切って
+// いたが、そのあとの直し（送り・パン・音量・鍵の曲線・強さの曲線・
+// 鍵の追従）で前提が変わり、入れたほうが良くなった:
+//
+//   `native の口` のいちばん悪い値   切 -0.41dB -> 入 **-0.05dB**
+//   SoundTrk の鍵 84                切 -10dB   -> 入 **+0.25dB**
+//
+// `SMU2000_CUT_EXACT=0` で前の道に戻せる
 inline bool cut_exact()
 {
-	static const bool on = std::getenv("SMU2000_CUT_EXACT") != nullptr;
+	static const bool on = [] {
+		const char *e = std::getenv("SMU2000_CUT_EXACT");
+		return !e || (e[0] != '0' || e[1]);
+	}();
 	return on;
 }
 
@@ -1154,7 +1197,7 @@ inline slot_regs build_note(const u8 *rom, const u8 *elem, int note, int att,
                             int vel = 100)
 {
 	slot_regs r;
-	const u8 *we = wave_entry(rom, wave_set(elem), wave_note(elem, note));
+	const u8 *we = wave_entry(rom, wave_set(elem), wave_note(rom, elem, note));
 	if (!we)
 		return r;
 	const wave_info w = read_wave(we);
@@ -1166,10 +1209,8 @@ inline slot_regs build_note(const u8 *rom, const u8 *elem, int note, int att,
 	// 0-0xFFF に収める。鍵の追従を入れていなかったので、Flute のように
 	// 曲線を持つ音色で鍵を押した瞬間の値がずれていた（6.71）
 	// **鍵を押した瞬間の値そのもの**は `cutoff_keyon` が出せる（14 音色 ×
-	// 鍵 5 通り × 強さ 3 通りで実機と完全に一致）。けれども今はまだ既定で
-	// 使えない: 写し取りの無いスロットはフィルタの包絡線が動かないので、
-	// 包絡線の初めのぶんだけ開いたままになり、試し曲が 0.36dB 明るくなる。
-	// `SMU2000_CUT_EXACT=1` で試せる（doc/native-engine.md の 6.71）
+	// 鍵 5 通り × 強さ 3 通りで実機と完全に一致）。**既定で入**（6.116）。
+	// `SMU2000_CUT_EXACT=0` で写し取り前提の前の道に戻せる
 	r.set(0x00, cut_exact()
 	            ? cutoff_keyon(rom, elem, note, vel)
 	            : u16(0x1000 | (rd16(rom, CUTOFF_TAB + u32(elem[37]) * 2) & 0x7ff)));
@@ -1235,7 +1276,7 @@ inline slot_regs build_note(const u8 *rom, const u8 *elem, int note, int att,
 	// 要素の byte17 は**半音単位の粗調**、byte18 は**セント単位の離調**（どちらも 64 が中央）。
 	// 離調は重ねの音色で 2 つの層をずらすのに使う。入れないと層がぴったり重なって
 	// 打ち消し合わず、3dB ほど大きくなる（doc/native-engine.md の 6.18）
-	r.set(0x11, pitch_reg(w, note, key_follow(elem), cents_extra + elem_tune(elem),
+	r.set(0x11, pitch_reg(w, note, key_follow(rom, elem), cents_extra + elem_tune(elem),
 	                      key_pivot(elem)));
 	// **鳴らし始める位置をずらす**（実機の `0x12A9C8`）。要素の byte79 が
 	// 128 サンプル単位、byte80 が 1 サンプル単位の下駄で、ループ前の長さから

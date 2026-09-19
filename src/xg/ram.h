@@ -22,6 +22,11 @@ namespace ram {
 // ワーク RAM の先頭（0x400000）からの位置
 constexpr u32 SYSTEM   = 0x226c1;   // 00 00 00-06
 constexpr u32 SYS_VOLUME    = SYSTEM + 4;   // 00 00 04（マスター音量）
+// **パートの音量の目盛り**（0-128）。実機はここを音量の目盛りに掛ける
+// （`0x12A4AA`）。音量・エクスプレッション・マスター音量だけでなく、
+// **インサーションを通すと下がる**（LO-FI を掛けたパートで 101 -> 80）。
+// だから式で作らず、実機が持っている値を読む（doc/native-engine.md の 6.114）
+constexpr u32 PART_GAIN = 0x12f;
 constexpr u32 SYS_TRANSPOSE = SYSTEM + 6;   // 00 00 06（64 が 0 半音）
 // **ドラムセットアップ**（XG の `3n rr nn`）。SysEx を書いて、書かれた番地を
 // 見て並びを割り出した（`3n` が組 0-3、`rr` が鍵 13-91、`nn` がパラメータ 0-22）:

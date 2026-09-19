@@ -254,12 +254,16 @@ def step_threading(rep, roms, first):
 
 # **波形の相関の下限**（試験ごと）。いま出ている値から少し余裕を引いたもの。
 # ここを下回ったら落ちる ＝ 形が崩れたら気づける。
-# porta と dense がまだ低いのは分かっている不具合（doc/native-engine.md の 6.82）
+# dense がまだ低いのは分かっている不具合（写し取りの音だけ、実機の側が
+# 混み具合で遅れる。doc/native-engine.md の 6.90）
 SHAPE_MIN = {
-    "piano":   0.98, "chord":  0.95, "drums": 0.85, "effects": 0.98,
-    "dense":   0.40, "port_b": 0.98, "bend":  0.98, "lofi":    0.98,
-    "egcc":    0.98, "porta":  0.38, "at":    0.95, "sxparam": 0.95,
+    "piano":   0.98, "chord":  0.95, "drums": 0.90, "effects": 0.98,
+    "dense":   0.50, "port_b": 0.98, "bend":  0.98, "lofi":    0.98,
+    "egcc":    0.98, "porta":  0.95, "at":    0.95, "sxparam": 0.95,
     "pedals":  0.95, "partsx": 0.95,
+    # keylevel は鍵と強さで音量が大きく動く音色ばかりなので、鍵を押す時刻の
+    # ばらつき（6.90）が相関に出やすい。**音量のほうは `native の口` が見る**
+    "keylevel": 0.50,
 }
 
 
@@ -383,6 +387,89 @@ def step_sampling(rep, roms):
     rep.add("sampling", rc == 0, note)
 
 
+def step_usb(rep, roms, cases):
+    """**USB の口でも native が firmware と同じ時刻で鳴るか**
+    （doc/native-engine.md の 6.120）。プラグインは USB が既定なのに、
+    native の口は MIDI のバイトを DIN の速さ（31250 baud ＝ 14.1 サンプル）で
+    並べていて、実機（19500 byte/s ＝ 2.26 サンプル）より 1 音あたり
+    37 サンプル遅れていた。試験はふだん DIN で鳴らすので気づけなかった"""
+    import math
+    name = "chord"
+    if name not in cases:
+        rep.add("USB の口", True, "この回では見ない")
+        return
+    midi, seconds = cases[name]
+    env = {"SMU2000_NO_VOICECACHE": "1"}
+    a, _ = render(roms, "usb_fw", midi, seconds, extra=["--usb"], env=env)
+    b, _ = render(roms, "usb_ne", midi, seconds,
+                  extra=["--usb", "--native-engine"], env=env)
+    if a is None or b is None:
+        rep.add("USB の口", False, "鳴らせなかった")
+        return
+    fa, ra, ca, _ = fpmod.load_wav(str(WORK / "usb_fw.wav"))
+    fb, rb, cb, _ = fpmod.load_wav(str(WORK / "usb_ne.wav"))
+    n = min(len(fa) // ca, len(fb) // cb)
+    skip = int(round(BOOT_AT * ra))
+    cs = []
+    for s0 in range(skip, n - ra, ra):
+        sa = fa[s0 * ca:(s0 + ra) * ca:ca]
+        sb = fb[s0 * cb:(s0 + ra) * cb:cb]
+        na = sum(float(x) * x for x in sa)
+        nb = sum(float(x) * x for x in sb)
+        if na < 1e4 or nb < 1e4:
+            continue
+        num = sum(float(x) * float(y) for x, y in zip(sa, sb))
+        cs.append(num / math.sqrt(na * nb))
+    if not cs:
+        rep.add("USB の口", False, "音が無い")
+        return
+    med = sorted(cs)[len(cs) // 2]
+    ok = med >= 0.95
+    rep.add("USB の口", ok, "%s の波形の相関 %.0f%%" % (name, 100 * med))
+
+
+# パネルの試験で押すボタン（品書きを一巡りする）
+PANEL_KEYS = ("play,util,enter,value+,value+,exit,edit,enter,value+,exit,exit,"
+              "part+,mute,play,drum,piano,organ,select,edit,enter,enter,exit,exit")
+
+
+def step_panel(rep, roms):
+    """**native の口でもパネルが効くか**（doc/native-engine.md の 6.119）。
+    ボタン・ダイヤル・液晶はぜんぶ firmware の仕事なので、firmware を細く
+    回したままだと一切効かない。同じボタンの並びを firmware の道と native の
+    口で押して、液晶が 1 行残らず同じになるかを見る"""
+    exe = BUILD / ("panel" + EXE)
+    if not exe.exists():
+        rep.add("パネル", False, "%s が無い" % exe)
+        return
+    outs = []
+    for tag, extra in (("fw", []), ("ne", ["--native"])):
+        log = WORK / ("panel_%s.log" % tag)
+        rc = run([exe, roms, "--keys", PANEL_KEYS, "--trace"] + extra,
+                 out=log, err=log)
+        if rc != 0:
+            rep.add("パネル", False, "%s で鳴らせなかった" % tag)
+            return
+        txt = log.read_text(encoding="utf-8", errors="replace").splitlines()
+        # `--trace` が出す「ボタン名 + 液晶 1 行」だけを取る
+        outs.append([l for l in txt if l.startswith("  ") and "|" in l])
+    if not outs[0]:
+        rep.add("パネル", False, "液晶が読めなかった")
+        return
+    bad = [i for i in range(min(len(outs[0]), len(outs[1])))
+           if outs[0][i] != outs[1][i]]
+    ok = not bad and len(outs[0]) == len(outs[1])
+    if ok:
+        note = "%d 行とも firmware と同じ" % len(outs[0])
+    elif bad:
+        note = "%d 行目から違う: %s / %s" % (bad[0] + 1,
+                                             outs[0][bad[0]].strip(),
+                                             outs[1][bad[0]].strip())
+    else:
+        note = "行数が違う（%d / %d）" % (len(outs[0]), len(outs[1]))
+    rep.add("パネル", ok, note)
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser()
@@ -446,6 +533,14 @@ def main():
         print()
         print("== 7. サンプリング（録音して試聴する）")
         step_sampling(rep, roms)
+
+        print()
+        print("== 8. パネル（native の口でもボタンと液晶が効くか）")
+        step_panel(rep, roms)
+
+        print()
+        print("== 9. USB の口（プラグインの既定）")
+        step_usb(rep, roms, cases)
 
     rep.show()
     return 1 if rep.bad else 0

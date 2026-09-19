@@ -144,6 +144,7 @@ public:
 		m_rec = false;
 		m_traj_next = 0;
 		m_pend.clear();
+		m_busy = 0;
 		m_age = 0;
 	}
 
@@ -208,7 +209,58 @@ public:
 	// 進む（doc/native-engine.md の 6.60）。その位相は起動から決まっているので、
 	// native の口が始まる前に firmware が書いた 0x00 の時刻から拾っておく。
 	// native の口が始まったあとは firmware の時間が遅れるので、拾い直さない
-	void set_eg_phase(u32 sample) { m_eg_phase = sample % FENV_TICK; }
+	// **10ms タイマの位相を実機から学ぶ**（6.118）。firmware の 10ms 割り込みは
+	// 世界共通なので、包絡線も滑りも「鍵を押した時刻」ではなくこの格子に乗る。
+	//
+	// **いちばん早いものを取ってはいけない**。`0x00` はタイマだけでなく
+	// **鍵を押したときにも**書かれる。そちらは好きな時刻に来るので、
+	// 1 回でも早いものが混じると位相がそこに居着いてしまう（`--bootcache`
+	// では正しく、実際に起動させると 141 サンプルずれていた。6.118）。
+	// タイマの書き込みは 1 か所に集まり、鍵のぶんは散らばるので、
+	// **いちばん数の多い位相**を取る
+	void set_eg_phase(u32 sample)
+	{
+		const u32 p = sample % FENV_TICK;
+		if (m_eg_hits[p] == 0xffff)
+			return;
+		const u16 n = ++m_eg_hits[p];
+		if (n > m_eg_best) {
+			m_eg_best = n;
+			m_eg_phase = p;
+			// 数が溜まるまでは信じない（鍵のぶんだけで決めないように）
+			if (n >= EG_PHASE_MIN)
+				m_eg_have = true;
+		}
+	}
+	static constexpr u16 EG_PHASE_MIN = 16;
+	// **包絡線のほうは格子に乗せても変わらない**（6.121）。滑り
+	// （`porta_grid`）は 81% → 99% になったが、こちらは keylevel が
+	// 100% → 99% とむしろ少し落ちるだけだったので既定は切。
+	// `SMU2000_EG_GRID=1` で試せる
+	static bool eg_grid()
+	{
+		static const bool on = [] {
+			const char *e = std::getenv("SMU2000_EG_GRID");
+			return e && (e[0] != '0' || e[1]);
+		}();
+		return on;
+	}
+	// **滑りは実機の 10ms 格子に乗せる**（6.121）。`SMU2000_PORTA_GRID=0` で
+	// 前の道（写し取りの相対値を鍵の時刻に足す）に戻せる
+	static bool porta_grid()
+	{
+		static const bool on = [] {
+			const char *e = std::getenv("SMU2000_PORTA_GRID");
+			return !e || (e[0] != '0' || e[1]);
+		}();
+		return on;
+	}
+	// x 以降でいちばん早い格子の目
+	u64 eg_after(u64 x) const
+	{
+		const u64 base = x - (x % FENV_TICK) + m_eg_phase;
+		return base >= x ? base : base + FENV_TICK;
+	}
 
 	// そのスロットを firmware がまだ使っていそうか
 	bool fw_recent(int slot) const
@@ -273,14 +325,19 @@ public:
 	{
 		m_clock = clock;
 		if (!m_pend.empty()) {
+			// **同じ時刻のものは 1 回で押す**。実機も要素をまとめて
+			// 押すので、要素ごとに分けると合図が 2 回になってしまう
 			size_t w = 0;
+			u64 now = 0;
 			for (size_t i = 0; i < m_pend.size(); i++) {
 				if (m_pend[i].at <= clock)
-					key_on(m_pend[i].mask);
+					now |= m_pend[i].mask;
 				else
 					m_pend[w++] = m_pend[i];
 			}
 			m_pend.resize(w);
+			if (now)
+				key_on(now);
 		}
 		if (!m_traj)
 			return;
@@ -657,14 +714,27 @@ public:
 	int part_pan(int part) const  { return m_ram ? int(m_ram[ram::part_base(part) + 0x0e]) : 64; }
 	int part_mod(int part) const  { return m_ram ? int(m_ram[ram::part_base(part) + ram::PART_MOD]) : 0; }
 	int part_rev(int part) const  { return m_ram ? int(m_ram[ram::part_base(part) + 0x13]) : 40; }
-	// **そのパートの音量の目盛り**（0-128）。実機はパートの塊 +0x12F に持つ。
-	// 音量・エクスプレッションに**マスター音量も同じ形で掛かる**（実測。
-	// マスター 88 でパートの塊が 101 -> 70 ＝ (101 * 89) >> 7）
+	// **そのパートの音量の目盛り**（0-128）。実機はパートの塊 +0x12F に持ち、
+	// 音量の目盛りに掛ける（`0x12A4AA`）。中身は
+	//
+	//   ((音量+1)*(エクスプレッション+1))>>7 に、マスター音量が同じ形で掛かり、
+	//   **インサーションを通すとさらに下がる**（LO-FI で 101 -> 80）
+	//
+	// なので式では作れない。**実機の値を読んで、こちらが動かしたぶんだけ
+	// 比で直す**（つまみを動かしても firmware は 100ms 以内に追いつくが、
+	// その間も正しい値を出せる）。6.114
 	int vol_gain_of(int part, int vol, int expr) const
 	{
 		int g = nv::vol_gain(vol, expr);
-		if (m_ram)
+		if (m_ram) {
 			g = (g * (int(m_ram[ram::SYS_VOLUME]) + 1)) >> 7;
+			// RAM の値と、RAM のつまみから作った値の比で直す
+			const int g_ram = int(m_ram[ram::part_base(part) + ram::PART_GAIN]);
+			int g_calc = nv::vol_gain(part_vol(part), part_expr(part));
+			g_calc = (g_calc * (int(m_ram[ram::SYS_VOLUME]) + 1)) >> 7;
+			if (g_calc > 0)
+				g = g * g_ram / g_calc;
+		}
 		return g < 0 ? 0 : (g > 128 ? 128 : g);
 	}
 
@@ -987,7 +1057,13 @@ private:
 			if (e.reg == 0x00 && !e.rel) { at0 = e.at; break; }
 		// 鍵を押した直後の 1 目は、実機も値を動かさない（張った値を書くだけ）。
 		// だから 1 目ぶん遅らせて進め始める
-		s.fnext = u64(s64(s.tstart + at0 + FENV_TICK) + EG_LAG);
+		// **実機の 10ms 割り込みは世界共通**（6.118）。鍵を押したあと最初に
+		// 来る目が 1 目め。写し取りの at0 は写し取った音の鍵からの相対なので、
+		// そのまま足すと鍵ごとに位相がずれる（実機の位相は 304、こちらは
+		// 曲ごとに 86-308 とばらばらだった）。位相をまだ学べていない間だけ at0 を使う
+		s.fnext = (m_eg_have && eg_grid())
+		        ? eg_after(u64(s64(s.tstart) + EG_LAG)) + FENV_TICK
+		        : u64(s64(s.tstart + at0 + FENV_TICK) + EG_LAG);
 	}
 
 	// **離しの段**。鍵を離すと、実機はもう 1 段張って 0 へ向かう。
@@ -1053,7 +1129,7 @@ private:
 	u16 pitch_of(const slot_use &s) const
 	{
 		const part_cc &pc = m_cc[s.part];
-		return nv::pitch_reg(nv::read_wave(s.wave), s.note, nv::key_follow(s.elem),
+		return nv::pitch_reg(nv::read_wave(s.wave), s.note, nv::key_follow(m_rom, s.elem),
 		                     nv::bend_cents(pc.bend, pc.range) + nv::elem_tune(s.elem)
 		                     + s.glide / 256, nv::key_pivot(s.elem));
 	}
@@ -1248,12 +1324,14 @@ public:
 		bool any = false;
 		u32 taken = 0;                   // もう使った写し取りの印
 		int used = 0;
+		int nwrote = 0;                  // レジスタを書いた要素の数
+		std::vector<std::pair<u64, u32>> pend;   // スロット → byte72 の遅れ
 		for (int k = 0; k < nelem; k++) {
 			const u8 *el = nv::element(m_rom, rec, k);
 			if (!nv::element_active(el, pnote, pvel))
 				continue;
 			// 波形の番地で、写し取ったスロットと結び付ける
-			const u8 *we = nv::wave_entry(m_rom, nv::wave_set(el), nv::wave_note(el, pnote));
+			const u8 *we = nv::wave_entry(m_rom, nv::wave_set(el), nv::wave_note(m_rom, el, pnote));
 			const nv::voice_cal *c =
 			    we ? nv::match_cal(cals, nv::read_wave(we).format_addr, &taken) : nullptr;
 			if (!c && size_t(used) < cals.size()) {
@@ -1281,7 +1359,7 @@ public:
 				m_traj = true;
 				m_traj_next = 0;       // つぎの tick で見直す
 			}
-			su.lvl0  = nv::volume_level(m_rom, el, c ? c->base_level : 64, pnote);
+			su.lvl0  = nv::volume_level(m_rom, rec, el, pnote, c ? c->base_level : 0);
 			su.arest = nv::volume_rest(m_rom, el, pnote, pvel);
 			su.att   = nv::clamp_att(nv::volume_att_from(
 			    m_rom, su.lvl0, su.arest,
@@ -1300,13 +1378,17 @@ public:
 			if (pc.porta_on && src >= 0 && src != note) {
 				su.glide_step = nv::porta_step(m_rom, pc.porta_time);
 				if (su.glide_step > 0) {
-					su.glide = (src - note) * nv::key_follow(el) * 256;
+					su.glide = (src - note) * nv::key_follow(m_rom, el) * 256;
 					// firmware の 10ms タイマは世界共通なので、鍵を押した時刻からで
 					// なく**格子**に乗せる（同時に鳴る音の滑りがそろう）。
 					// 格子は包絡線と同じ（録画から取った実機の目）を使う（6.82）
-					su.glide_next = su.fnext > nv::PORTA_TICK
-					              ? su.fnext - nv::PORTA_TICK
-					              : (m_clock / nv::PORTA_TICK + 1) * nv::PORTA_TICK;
+					// **滑りだけ実機の 10ms 格子に乗せてみる道**（6.118）。
+					// `SMU2000_PORTA_GRID=1` で試せる。包絡線の格子は触らない
+					su.glide_next = (m_eg_have && porta_grid())
+					              ? eg_after(u64(s64(m_clock) + EG_LAG))
+					              : (su.fnext > nv::PORTA_TICK
+					                 ? su.fnext - nv::PORTA_TICK
+					                 : (m_clock / nv::PORTA_TICK + 1) * nv::PORTA_TICK);
 				}
 			}
 			// **移調した鍵と、感度を掛けた強さで組む**（6.104）。ここに元の鍵を
@@ -1350,16 +1432,21 @@ public:
 				             part, note, vel, pc.vol, c ? c->cal_vol : -9, pc.expr, c ? c->cal_expr : -9,
 				             pc.pan, c ? c->cal_pan : -9, su.att, note_att(su, part));
 			// byte72 が 0 でなければ、その要素は遅れて鳴る
-			const u32 dly = nv::elem_delay(el);
-			if (dly)
-				m_pend.push_back({ u64(1) << slot, m_clock + dly });
-			else
-				keymask |= u64(1) << slot;
+			pend.push_back({ u64(1) << slot, nv::elem_delay(el) });
+			nwrote++;
 			any = true;
 		}
 		if (any) {
 			m_cc[part].last = note;      // つぎの音はここから滑る
 			m_cc[part].porta_src = -1;   // CC84 の指定は 1 度で使い切る
+		}
+		// **要素を書き終えてから鍵を押す**（6.117）
+		const u64 at = write_done(nwrote);
+		for (const auto &p : pend) {
+			if (p.second || at > m_clock)
+				m_pend.push_back({ p.first, at + p.second });
+			else
+				keymask |= p.first;
 		}
 		if (!keymask)
 			return any;                  // 遅らせた要素だけの音もある
@@ -1435,6 +1522,7 @@ public:
 			s.sost = false;
 		}
 		m_pend.clear();
+		m_busy = 0;
 		m_traj = false;
 		m_traj_next = 0;
 	}
@@ -1619,6 +1707,35 @@ private:
 		       nv::peg_reg(m_rom, nv::peg_cents(s.elem, lvl, s.pvel), s.elem));
 	}
 
+	// **要素 1 つぶんのレジスタを書く時間**（1/64 サンプル単位）。
+	// 実機は要素のレジスタを **1 要素 34 本**書き、**全部書き終えてから**
+	// 鍵を押す。SWP30 への書き込みは 1 本 440 サイクル待たされるので
+	// （＋命令のぶんで 1 本あたり約 560 サイクル）、34 本でちょうど
+	// **30 サンプル**かかる。要素が 1 つ増えるごとに鍵がそのぶん遅れる。
+	// こちらは一度に書いて即座に押していたので、2 要素の音色
+	// （Square Lead など）が 30 サンプル早く鳴っていた
+	// （doc/native-engine.md の 6.117）。`SMU2000_ELEM_COST` で振れる
+	static u32 elem_cost64()
+	{
+		static const u32 v = std::getenv("SMU2000_ELEM_COST")
+		                   ? u32(std::atoi(std::getenv("SMU2000_ELEM_COST"))) : 30 * 64;
+		return v;
+	}
+	// **要素を全部書き終える時刻**を返す（サンプル）。実機は 1 つの
+	// CPU で順番に書くので、前の音がまだ書き終わっていなければその
+	// あとに並ぶ。和音や密な曲では、あとの音ほど遅れて鳴る
+	u64 write_done(int nwrote)
+	{
+		const u64 cost = elem_cost64();
+		const u64 now = m_clock * 64;
+		// こちらが呼ばれる時刻は「1 要素を書き終えた時刻」なので、
+		// 書き始めはその 1 要素ぶん手前
+		const u64 t0 = now > cost ? now - cost : 0;
+		const u64 start = t0 > m_busy ? t0 : m_busy;
+		m_busy = start + u64(nwrote < 1 ? 1 : nwrote) * cost;
+		return (m_busy + 32) / 64;
+	}
+
 	void key_on(u64 mask)
 	{
 		static const u32 MASK_REG[4] = { 0x1cf, 0x1ce, 0x18f, 0x18e };
@@ -1659,6 +1776,9 @@ private:
 	// 実機の包絡線は 441 サンプル（10ms）の格子で進む
 	static constexpr u64 FENV_TICK = 441;
 	u32 m_eg_phase = 0;
+	bool m_eg_have = false;
+	u16 m_eg_best = 0;
+	std::array<u16, FENV_TICK> m_eg_hits{};
 	std::array<u32, PARTS> m_recsel{};
 	std::array<s8, PARTS> m_recsel_drum{};
 	u64 m_clock = 0;
@@ -1669,6 +1789,8 @@ private:
 	// 遅らせて鳴らす要素（byte72）。時が来たら key_on する
 	struct pending_key { u64 mask; u64 at; };
 	std::vector<pending_key> m_pend;
+	// firmware がレジスタを書き終える時刻（1/64 サンプル単位）
+	u64 m_busy = 0;
 	u64 m_age = 0;
 };
 
